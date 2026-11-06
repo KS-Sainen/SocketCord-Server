@@ -1,0 +1,5 @@
+psycopg[binary]>=3.2,<4
+psycopg-pool>=3.2,<4
+# AI summaries with Claude (GET chat/{id}/summary). Needs Python 3.10+; on 3.9 the
+# server still runs and answers summaries with its offline engine.
+anthropic>=2.5,<3; python_version >= "3.10"

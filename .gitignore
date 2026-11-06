@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Local env files with real keys (the example stays tracked)
+.env.*
+!.env.example
+
+# Editor and tool settings
+.vscode/
+.idea/
+.claude/

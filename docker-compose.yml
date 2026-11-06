@@ -1,0 +1,95 @@
+# docker compose up --build -d     -> PostgreSQL + SocketCord backend on TCP port 8080
+# docker compose logs -f backend   -> watch requests come in
+# docker compose down              -> stop (add -v to also delete the database volume)
+#
+# Settings come from .env (copy .env.example). Every setting the backend reads
+# is forwarded below; anything not set uses the default after ":-".
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: socketcord
+      POSTGRES_USER: socketcord
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-socketcord-dev-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socketcord -d socketcord"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    # Not published on purpose: only the backend talks to the database.
+    # Uncomment to look inside with psql or DBeaver from your machine:
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # The password travels in PGPASSWORD (libpq reads it), not inside the URL,
+      # so it may contain any character, '/' '@' '%' included.
+      DATABASE_URL: postgresql://socketcord@db:5432/socketcord
+      PGPASSWORD: ${POSTGRES_PASSWORD:-socketcord-dev-password}
+      SOCKETCORD_HOST: 0.0.0.0
+      SOCKETCORD_PORT: "8080"
+      SOCKETCORD_SECRET: ${SOCKETCORD_SECRET:-}
+      SOCKETCORD_WORKERS: ${SOCKETCORD_WORKERS:-16}
+      SOCKETCORD_MAX_CONNECTIONS: ${SOCKETCORD_MAX_CONNECTIONS:-1024}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SCRAM_ITERATIONS: ${SCRAM_ITERATIONS:-600000}
+      CHALLENGE_TTL_SECONDS: ${CHALLENGE_TTL_SECONDS:-60}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-168}
+      LOGIN_MAX_FAILURES: ${LOGIN_MAX_FAILURES:-5}
+      LOGIN_FAILURE_WINDOW_SECONDS: ${LOGIN_FAILURE_WINDOW_SECONDS:-300}
+      LOGIN_MAX_FAILURES_PER_CLIENT: ${LOGIN_MAX_FAILURES_PER_CLIENT:-50}
+      # Docker Desktop / OrbStack on a Mac (and campus NAT in front of a cloud
+      # server) can show many clients as ONE address, so the per-address limits
+      # below are looser than the code defaults. On a Linux host you can tighten them.
+      CHALLENGE_RATE_PER_MINUTE: ${CHALLENGE_RATE_PER_MINUTE:-120}
+      CHALLENGE_BURST: ${CHALLENGE_BURST:-40}
+      REG_LIMIT_ENABLED: ${REG_LIMIT_ENABLED:-true}
+      REG_LIMIT_WINDOW_HOURS: ${REG_LIMIT_WINDOW_HOURS:-24}
+      REG_LIMIT_DEVICE_MAX: ${REG_LIMIT_DEVICE_MAX:-1}
+      REG_LIMIT_IP_MAX: ${REG_LIMIT_IP_MAX:-20}
+      REG_LIMIT_EXEMPT: ${REG_LIMIT_EXEMPT:-}
+      GROUP_CREATE_PER_HOUR: ${GROUP_CREATE_PER_HOUR:-20}
+      REQUEST_RATE_PER_HOUR: ${REQUEST_RATE_PER_HOUR:-120}
+      MAX_PENDING_REQUESTS: ${MAX_PENDING_REQUESTS:-100}
+      DM_REQUIRE_ACCEPT: ${DM_REQUIRE_ACCEPT:-true}
+      MAX_CONNECTIONS_PER_USER: ${MAX_CONNECTIONS_PER_USER:-5}
+      # Behind Docker's port forwarding every client can look like one address.
+      MAX_CONNECTIONS_PER_IP: ${MAX_CONNECTIONS_PER_IP:-512}
+      MEMBERSHIP_RATE_PER_MINUTE: ${MEMBERSHIP_RATE_PER_MINUTE:-30}
+      MESSAGE_RATE_PER_MINUTE: ${MESSAGE_RATE_PER_MINUTE:-60}
+      PROFILE_RATE_PER_MINUTE: ${PROFILE_RATE_PER_MINUTE:-10}
+      # AI chat summaries (GET chat/{id}/summary). With no key the server answers
+      # with an offline summary that is not written by AI.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      AI_PROVIDER: ${AI_PROVIDER:-auto}
+      AI_MODEL: ${AI_MODEL:-claude-opus-5-5}
+      AI_EFFORT: ${AI_EFFORT:-low}
+      AI_MAX_TOKENS: ${AI_MAX_TOKENS:-8192}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-30}
+      AI_MAX_RETRIES: ${AI_MAX_RETRIES:-1}
+      AI_FALLBACKS: ${AI_FALLBACKS:-true}
+      AI_MAX_CONCURRENT: ${AI_MAX_CONCURRENT:-4}
+      AI_SUMMARY_PER_MINUTE: ${AI_SUMMARY_PER_MINUTE:-4}
+      AI_DAILY_LIMIT: ${AI_DAILY_LIMIT:-100}
+      AI_CACHE_SECONDS: ${AI_CACHE_SECONDS:-600}
+      AI_MAX_INPUT_CHARS: ${AI_MAX_INPUT_CHARS:-40000}
+    ports:
+      - "${SOCKETCORD_PORT:-8080}:8080"
+    # Every request is logged; keep the log from filling the disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  pgdata:
