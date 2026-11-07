@@ -218,7 +218,8 @@ def test_member_lists_in_replies_are_capped():
 
 # ---------------------------------------------------------------------- DMs
 
-def test_dm_sent_while_the_request_is_being_accepted_lands_in_the_room(server, monkeypatch):
+def test_dm_sent_while_the_request_is_being_accepted_lands_in_the_room(make_server, monkeypatch):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("acc_a"), server.user("acc_b")
     rid = a.post(f"users/{b.user_id}/dm", {"message": "hi"})["request"]["request_id"]
     stale = server.app.repo.find_dm(a.user_id, b.user_id)     # still pending when b's handler read it
@@ -239,7 +240,8 @@ def test_dm_sent_while_the_request_is_being_accepted_lands_in_the_room(server, m
     assert a.get("users/requests")["incoming"] == []
 
 
-def test_answering_a_request_closed_elsewhere_says_how(server):
+def test_answering_a_request_closed_elsewhere_says_how(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("closed_a"), server.user("closed_b")
     rid = a.post(f"users/{b.user_id}/dm", {"message": "hi"})["request"]["request_id"]
     a.post(f"users/requests/{rid}/cancel")

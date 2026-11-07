@@ -314,7 +314,8 @@ def test_decline_invite(server):
 
 # ---------------------------------------------------------------------- DMs (R7)
 
-def test_dm_request_accept_and_privacy(server):
+def test_dm_request_accept_and_privacy(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b, c = server.user("dana"), server.user("eli"), server.user("fay")
     pending = a.post(f"users/{b.user_id}/dm", {"message": "hi eli"})
     assert pending["status"] == "pending"
@@ -339,7 +340,8 @@ def test_dm_request_accept_and_privacy(server):
         c.wait_event("message", timeout=0.3)
 
 
-def test_dm_crossing_requests_open_the_room(server):
+def test_dm_crossing_requests_open_the_room(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("gus"), server.user("hal")
     a.post(f"users/{b.user_id}/dm", {"message": "from gus"})
     crossed = b.post(f"users/{a.user_id}/dm", {"message": "from hal"})

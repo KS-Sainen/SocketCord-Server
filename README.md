@@ -9,7 +9,7 @@ summary calls Anthropic's API over HTTPS with the official `anthropic` SDK
 (server to Anthropic only, never part of the client↔server protocol).
 
 * Wire format and challenge-response login: [docs/PROTOCOL.md](docs/PROTOCOL.md)
-* Every call and push, in full: [docs/API.md](docs/API.md)
+* Every call and push, in full: [docs/API.md](docs/API.md); a one-line list: [below](#calls)
 * Database: [below](#database), tables in [socketcord/db/schema.sql](socketcord/db/schema.sql)
 * AI summary (rubric Part 3): [below](#ai-chat-summary-part-3)
 
@@ -64,10 +64,10 @@ python3 -m pip install -r requirements-dev.txt
 python3 -m pytest
 ```
 
-The 233 tests use the in-memory database. About half of them start a real
+The 262 tests use the in-memory database. About half of them start a real
 server on a free port and talk to it over TCP; the rest check the
 repository, the wire format and the challenge-response math directly. To run the repository
-and server tests against PostgreSQL as well (417 tests in all), point
+and server tests against PostgreSQL as well (474 tests in all), point
 `SOCKETCORD_TEST_DATABASE_URL` at an empty throwaway database. No test calls
 the real AI API: the Claude tests run the real SDK against a local fake of
 the Messages API.
@@ -76,6 +76,41 @@ the Messages API.
 > created inside it breaks `source .venv/bin/activate`, because `PATH` uses `:`
 > as its separator. Call `.venv/bin/python -m ...` directly, or keep the venv
 > somewhere else.
+
+## Calls
+
+Every call, at a glance. Request and reply fields, errors, pushes and an
+example of each are in [docs/API.md](docs/API.md) (the section number is in
+the last column).
+
+| Method | URL | What it does | API.md |
+| ------ | --- | ------------ | ------ |
+| POST | `users` | register (two-step challenge-response) | 2.1 |
+| POST | `users/login` | log in (two steps) | 2.2 |
+| PATCH | `users/profile` | change your username and/or name colours (`text_color`, `text_bg_color` or `background`) | 2.3 |
+| GET | `users/info` | your account | 2.4 |
+| GET | `chats` | the chats you are in | 2.5 |
+| GET | `chat/{id}/info` | a chat's details and members | 2.6 |
+| GET | `chat/{id}/messages` | message history, with filters | 2.7 |
+| POST | `chat/{id}/message` | send a message | 2.8 |
+| POST | `users/{id}/dm` | send a DM; the first one opens the room (a request only with `DM_REQUIRE_ACCEPT=true`) | 2.9 |
+| POST | `chat/{id}/invite` | invite someone to a group | 2.10 |
+| PATCH | `users/profile/password` | change your password (two steps) | 2.11 |
+| POST | `users/logout` | end your session | 3.1 |
+| GET | `users/online` | who is online | 3.2 |
+| GET | `users/search` | find users by name | 3.3 |
+| GET | `users/requests` | your pending DM requests and invites | 3.4 |
+| POST | `users/requests/{id}/accept`, `/decline`, `/cancel` | answer or take back a request | 3.5–3.7 |
+| POST | `chats` | create a group | 3.8 |
+| GET | `chats/groups` | every group on the server | 3.9 |
+| POST | `chat/{id}/read` | move your read marker | 3.10 |
+| POST | `chat/{id}/join` | join a group by yourself | 3.11 |
+| POST | `chat/{id}/leave` | leave a group | 3.12 |
+| GET or POST | `chat/{id}/summary` | AI summary of a chat | 3.13 |
+| GET | `users/{id}/groups` | the groups a user is in | 3.14 |
+| GET | `chat/{id}/invitees` | who you can invite to a group (online people and your DM contacts) | 3.15 |
+| POST | `chat/{id}/invite/accept` | accept your invite to that group | 3.16 |
+| POST | `chat/{id}/invite/reject` | decline your invite to that group | 3.17 |
 
 ## How it works
 
@@ -211,7 +246,7 @@ published).
 | `REG_LIMIT_IP_MAX` | `1` (`20` in compose, because of NAT) | accounts per source IP per window (0 = rule off) |
 | `REG_LIMIT_WINDOW_HOURS` | `24` | the window both rules count over |
 | `REG_LIMIT_EXEMPT` | empty | CIDRs the IP rule skips, e.g. `127.0.0.0/8` |
-| `DM_REQUIRE_ACCEPT` | `true` | a DM request must be accepted before the room opens; `false` opens it with the first DM (use that until the GUI shows pending requests) |
+| `DM_REQUIRE_ACCEPT` | `false` | `false`: the first DM opens the DM room at once (what the GUI expects); `true`: the first DM is a request the receiver must accept before the room opens |
 | `LOG_LEVEL` | `INFO` | every request is logged with its source address and status |
 | `ANTHROPIC_API_KEY` | empty | key for AI summaries (read by the Anthropic SDK; never logged) |
 | `AI_PROVIDER` | `auto` | `auto` (Claude if a key is set and the `anthropic` library can be set up, otherwise offline), `claude`, `offline`, `off` |
@@ -242,15 +277,16 @@ published).
 | R10 | Join by yourself; an invite adds you only after you accept | `POST chat/{id}/join`, `.../invite` | `test_group_lifecycle`, `test_invite_needs_accept` |
 | R11 | Only members can read or send | membership check | `test_group_lifecycle` |
 
-R7: with `DM_REQUIRE_ACCEPT=true` (the team's design: the other side must
-accept), the first DM goes out as a request that carries the message.
-`DM_REQUIRE_ACCEPT=false` delivers it without that step.
+R7: by default (`DM_REQUIRE_ACCEPT=false`) the first DM opens the room at
+once, as the GUI expects. With `DM_REQUIRE_ACCEPT=true` the first DM goes
+out as a request that carries the message, and the other side must accept
+it first.
 
 Part 3, the AI feature: the **AI chat summary** (`GET chat/{id}/summary`,
 next section; tests in `tests/test_ai.py`). Beyond R1–R11 the backend also
 has the challenge-response login, the per-day registration limit, saved
 history in PostgreSQL, unread counts, message and user search, name colours,
-and Docker deployment. Every call and push, including the 13 calls that are
+and Docker deployment. Every call and push, including the 17 calls that are
 not in the frontend README, is documented in [docs/API.md](docs/API.md).
 
 ## AI chat summary (Part 3)
@@ -374,11 +410,10 @@ the data-in methods of `chat_page.py` and lists the client's duties.
    `251` only means that attempt failed (wrong password, expired challenge):
    show the error. One session per account: a login on another device ends
    this one (`logged_in_elsewhere`), so never log in again automatically.
-5. **Pending DM requests and invites.** With `DM_REQUIRE_ACCEPT=true` (the
-   default) a first DM is a request the receiver must accept, and an invite
-   waits to be accepted too. The GUI has no place to show them yet; until it
-   does, run the server with `DM_REQUIRE_ACCEPT=false`, and add a panel fed
-   by `GET users/requests` and `event/request`.
+5. **DMs and invites.** By default (`DM_REQUIRE_ACCEPT=false`) a first DM
+   opens the room at once. An invite waits to be accepted: answer it with
+   `POST chat/{id}/invite/accept` or `.../invite/reject`, and keep the list
+   current with `GET users/requests` and `event/request`.
 6. **Send read markers.** `POST chat/{id}/read` after showing a chat;
    otherwise unread counts and the NEW line never clear.
 7. **Wait longer for the AI summary.** `GET chat/{id}/summary` takes a few

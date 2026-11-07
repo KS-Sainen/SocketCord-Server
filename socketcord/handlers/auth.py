@@ -25,10 +25,10 @@ from ..router import ApiError, RequestContext, bad_request, forbidden, ok, unaut
 from ..security import Challenge, client_key, fake_salt, token_hash
 from ..views import user_view
 from . import router
+from .common import username_field
 
 log = logging.getLogger("socketcord.auth")
 
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
 B64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 DEVICE_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 PLAINTEXT_FIELDS = ("password", "old_password", "new_password")
@@ -46,12 +46,7 @@ def _reject_plaintext(ctx: RequestContext) -> None:
 
 
 def _username(ctx: RequestContext) -> str:
-    name = ctx.str_field("username", max_len=64)
-    if not USERNAME_RE.match(name):
-        raise bad_request("INVALID_USERNAME",
-                          "username must be 3-32 characters of letters, digits, '_', '.' or '-'",
-                          field="username")
-    return name
+    return username_field(ctx)   # the same rule PATCH users/profile applies to a new name
 
 
 def _client_nonce(ctx: RequestContext) -> str:
@@ -246,7 +241,10 @@ def _login_finish(ctx: RequestContext) -> ReplyCord:
     user = ctx.repo.get_user(ch.user_id) if ch.user_id else None
     am = scram.login_auth_message(ch.username, ch.client_nonce, ch.server_nonce, scram.b64e(ch.salt),
                                   ch.iterations, ch.challenge_id)
-    if user is None or user.salt != ch.salt or not scram.verify_client_proof(user.stored_key, am, proof):
+    # The name must still be the account's: after a rename (PATCH users/profile) the
+    # old name stops working, even for a challenge fetched just before it.
+    if user is None or user.salt != ch.salt or scram.canonical_username(user.username) != ch.username \
+            or not scram.verify_client_proof(user.stored_key, am, proof):
         raise unauthorized("INVALID_CREDENTIALS", "wrong username or password")
     token = uuid.uuid4()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ctx.config.session_ttl_seconds)

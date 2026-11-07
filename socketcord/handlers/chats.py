@@ -4,13 +4,13 @@ from __future__ import annotations
 import uuid
 from uuid import UUID
 
-from ..db.base import AlreadyMember, AlreadyRequested, MessageQuery, NotFoundError
+from ..db.base import AlreadyMember, AlreadyRequested, ChatRequest, MessageQuery, NotFoundError
 from ..protocol import GET, POST, ReplyCord
 from ..router import RequestContext, bad_request, forbidden, not_found, ok
-from ..views import chat_item_view, group_view, marker, message_view, ref_of, request_view
+from ..views import chat_item_view, group_view, marker, message_view, ref_of, request_view, user_view
 from . import router
 from .common import (MAX_MESSAGE_LEN, after_join, announce_membership, announce_pending, announce_request,
-                     chat_info_for, chat_item,
+                     answer_request, chat_info_for, chat_item,
                      check_request_limits, get_chat_or_404, group_item, hide_foreign_dm, limit, post_message,
                      require_member)
 
@@ -18,6 +18,7 @@ GROUP_PAGE_DEFAULT, GROUP_PAGE_MAX = 100, 200
 CHAT_PAGE_MAX = 200
 MEMBERS_IN_GROUP_LIST = 100     # per group in GET chats/groups (member_count is always exact)
 SEARCH_MAX_LEN = 50
+INVITEES_MAX = 50               # GET chat/{chat_id}/invitees answers at most this many people
 
 
 @router.route(GET, "chats")
@@ -155,6 +156,64 @@ def invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
         raise forbidden("ALREADY_INVITED", f"{target.username} already has a pending invite") from None
     announce_pending(ctx, req)
     return ok({"status": "pending", "request": request_view(req)})
+
+
+@router.route(GET, "chat/{chat_id:uuid}/invitees")
+def invitees(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
+    """Who the caller can invite to this group (the GUI's "Add people" search): people
+    online now or with an open DM with the caller, whose name contains `query`, minus
+    the caller, the members and anyone already invited. By username, at most 50."""
+    chat = get_chat_or_404(ctx, chat_id)
+    hide_foreign_dm(ctx, chat)
+    if chat.kind != "group":
+        raise bad_request("NOT_A_GROUP", "only groups take invites")
+    require_member(ctx, chat)
+    query = ctx.str_field("query", required=False, min_len=0, max_len=32, default="")
+    online, _ = ctx.hub.online_snapshot()
+    users = ctx.repo.find_invitees(chat_id, ctx.user.user_id, [u.user_id for u in online], query,
+                                   limit=INVITEES_MAX)
+    return ok({"chat_id": chat_id, "query": query, "count": len(users),
+               "users": [user_view(u, ctx.hub) for u in users]})
+
+
+def _my_invite(ctx: RequestContext, chat_id: UUID) -> ChatRequest:
+    """The caller's pending invite to this group, or 253 (also for a DM, and for a
+    group they are already in: neither has an invite to answer)."""
+    chat = get_chat_or_404(ctx, chat_id)
+    hide_foreign_dm(ctx, chat)
+    invite = ctx.repo.get_pending_invite(chat_id, ctx.user.user_id) if chat.kind == "group" else None
+    if invite is None:
+        if chat.kind == "group" and ctx.repo.get_member(chat_id, ctx.user.user_id) is not None:
+            raise not_found("REQUEST_NOT_FOUND", "you are already in this group; there is no invitation to answer")
+        raise not_found("REQUEST_NOT_FOUND", "you have no pending invitation to this group")
+    return invite
+
+
+@router.route(POST, "chat/{chat_id:uuid}/invite/accept")
+def accept_invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
+    """Accept your pending invitation to a group: the same as
+    POST users/requests/{request_id}/accept on that invite, and the same reply as
+    POST chat/{chat_id}/join ({"chat", "info"}, plus the accepted "request")."""
+    invite = _my_invite(ctx, chat_id)
+    # A join, announced to everyone online: limited like POST chat/{chat_id}/join.
+    limit(ctx, ctx.app.membership_limiter, "joining and leaving groups")
+    result = answer_request(ctx, invite, "accepted")
+    if result is None:
+        raise not_found("REQUEST_NOT_FOUND", "the invitation was cancelled or answered a moment ago")
+    if "info" not in result:     # the group was deleted at that very moment
+        raise not_found("CHAT_NOT_FOUND", "no such chat")
+    return ok({"chat": result["chat"], "info": result["info"], "request": result["request"]})
+
+
+@router.route(POST, "chat/{chat_id:uuid}/invite/reject")
+def reject_invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
+    """Decline your pending invitation to a group: the same as
+    POST users/requests/{request_id}/decline on that invite."""
+    invite = _my_invite(ctx, chat_id)
+    result = answer_request(ctx, invite, "declined")
+    if result is None:
+        raise not_found("REQUEST_NOT_FOUND", "the invitation was cancelled or answered a moment ago")
+    return ok({"chat_id": chat_id, "status": "declined", "request": result["request"]})
 
 
 @router.route(POST, "chat/{chat_id:uuid}/join")

@@ -247,6 +247,16 @@ class GroupListItem:
 
 
 @dataclass
+class MemberGroup:
+    """One row of GET users/{user_id}/groups: a group the user is an accepted member of."""
+    chat: Chat
+    role: str                     # that user's role in it: "owner" | "member"
+    joined_at: datetime           # when that user joined
+    member_count: int             # accepted members
+    viewer_is_member: bool = False    # the user who asked is an accepted member too
+
+
+@dataclass
 class RegistrationRule:
     """At most `max_count` accounts per window whose created_ip / created_device equals `value`."""
 
@@ -320,9 +330,14 @@ class Repository(ABC):
 
     @abstractmethod
     def update_profile(self, user_id: UUID, text_color: Optional[str],
-                       text_bg_color: Optional[str]) -> Optional[User]:
-        """Sets the given colours ("#rrggbb", already lowercase); None keeps a colour.
-        Raises SameColors if the result would have equal colours. None if no such user."""
+                       text_bg_color: Optional[str], username: Optional[str] = None) -> Optional[User]:
+        """Sets the given colours ("#rrggbb", already lowercase) and username; None keeps
+        a value. One atomic update. The username follows the registration rules and
+        stays unique without regard to case: renaming to your own name in another case
+        is fine, a name another user has raises UsernameTaken. The SCRAM verifier does
+        not depend on the name, so the password keeps working. Raises SameColors if the
+        result would have equal colours (checked before the name's uniqueness). None if
+        no such user."""
 
     # ---- sessions: one per account
     @abstractmethod
@@ -369,7 +384,7 @@ class Repository(ABC):
 
     @abstractmethod
     def create_dm(self, initiator: UUID, receiver: UUID) -> Tuple[Chat, bool]:
-        """An ACCEPTED DM made at once (DM_REQUIRE_ACCEPT=false). Returns (chat,
+        """An ACCEPTED DM made at once (DM_REQUIRE_ACCEPT=false, the default). Returns (chat,
         created); if the pair already has a DM (any status) it is returned with
         created=False. Raises NotFoundError if a user is gone."""
 
@@ -385,6 +400,21 @@ class Repository(ABC):
     def list_groups(self, offset: int = 0, limit: int = 200) -> Tuple[List[GroupListItem], bool]:
         """Groups with at least one accepted member, oldest first, each with its
         accepted members, from one consistent snapshot. Returns (page, has_more)."""
+
+    @abstractmethod
+    def list_member_groups(self, user_id: UUID, viewer_id: Optional[UUID] = None) -> List[MemberGroup]:
+        """Every group `user_id` is an accepted member of, by lower(group name) then
+        chat_id ([] for an unknown user). viewer_is_member says whether `viewer_id`
+        is an accepted member of each one too."""
+
+    @abstractmethod
+    def find_invitees(self, group_id: UUID, inviter_id: UUID, online_ids: Iterable[UUID],
+                      query: str = "", limit: int = 50) -> List[User]:
+        """People `inviter_id` could invite to group `group_id`: users in `online_ids`
+        or with an ACCEPTED DM with the inviter, whose username contains `query`
+        (case-insensitive, literal: no wildcards; "" = everyone), except the inviter
+        and anyone with a membership row in the group (accepted members and pending
+        invitees). By lower(username), at most `limit`."""
 
     @abstractmethod
     def get_members(self, chat_id: UUID) -> List[Member]:
@@ -443,6 +473,11 @@ class Repository(ABC):
     @abstractmethod
     def get_request(self, request_id: UUID) -> Optional[ChatRequest]:
         """A DM (by its chat id) or an invite (by membership_id), pending or accepted."""
+
+    @abstractmethod
+    def get_pending_invite(self, group_id: UUID, user_id: UUID) -> Optional[ChatRequest]:
+        """The PENDING invite of `user_id` to group `group_id`, or None (no row, or
+        already an accepted member)."""
 
     @abstractmethod
     def list_pending_requests(self, user_id: UUID) -> Tuple[List[ChatRequest], List[ChatRequest]]:

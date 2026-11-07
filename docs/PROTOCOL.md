@@ -131,12 +131,14 @@ The binary packet layout is unchanged. Everything else that differs:
    * Users have a username and two colours, `text_color` and
      `text_bg_color` (`"#rrggbb"`, default `"#171717"` on `"#f2f2f2"`, the
      frontend's own defaults). There is no display name and no bio.
-     `PATCH users/profile` sets the colours, and every user object in a
+     `PATCH users/profile` sets the colours and can rename the user (the
+     name stays unique without regard to case), and every user object in a
      reply carries them, so the GUI can paint names without extra calls.
    * Every id is a UUID string. Message ids are UUIDv7: they grow with time,
      so `before_id`, `after_id` and `last_read_message_id` page and count by
      them, and two ids compare correctly as lower-case strings.
-   * A DM starts as a **DM request**: a pending `dms` row whose
+   * By default the first DM opens the DM room at once. With
+     `DM_REQUIRE_ACCEPT=true` a DM starts as a **DM request**: a pending `dms` row whose
      `request_id` is the DM's chat id. A group invite is a pending
      `group_memberships` row whose `request_id` is its membership id. The
      receiver accepts or declines, the sender may cancel. Declined and
@@ -166,8 +168,10 @@ The binary packet layout is unchanged. Everything else that differs:
    `GET users/online`, `GET users/search`, `GET users/requests`,
    `POST users/requests/{id}/accept|decline|cancel`, `POST chats`,
    `GET chats/groups`, `POST chat/{id}/read`, `POST chat/{id}/join`,
-   `POST chat/{id}/leave`, `GET chat/{id}/summary`. All are documented in
-   full in [API.md](API.md) section 3.
+   `POST chat/{id}/leave`, `GET chat/{id}/summary` (also by POST),
+   `GET users/{id}/groups`, `GET chat/{id}/invitees`,
+   `POST chat/{id}/invite/accept|reject`. All are documented in full in
+   [API.md](API.md) section 3.
 
 ---
 
@@ -194,20 +198,20 @@ Every `error` code the backend sends:
 | `INVALID_ENCODING` | 250 | The URL or message is not UTF-8. No `rid`. |
 | `CONNECTION_CLOSED` | 250 | Register, login or password change, step 1: the connection closed while the challenge was being made, so none was kept. Nobody reads this reply. |
 | `PLAINTEXT_PASSWORD` | 250 | Register, login or password change: the message contains `password`, `old_password` or `new_password`. Has `field`. |
-| `INVALID_USERNAME` | 250 | Register or login: the username breaks the rules. Has `field`. |
+| `INVALID_USERNAME` | 250 | Register, login or rename (`PATCH users/profile`): the username breaks the rules. Has `field`. |
 | `INVALID_TARGET` | 250 | A DM to yourself, or inviting yourself. |
 | `INVALID_PROOF` | 251 / 250 | The encrypted verifier failed its integrity check: 251 at registration, 250 at a password change. |
 | `INVALID_SESSION` | 251 | The session token is unknown, ended (logout, a newer login, a password change), expired, or not this User ID's; also a login, or a password change, whose new session another login of the same account replaced at the same moment. |
 | `INVALID_CREDENTIALS` | 251 / 252 | Login (251): wrong password or unknown username. Password change (252): the current password is wrong. |
 | `CHALLENGE_INVALID` | 251 / 252 | The challenge is unknown, used, expired, or from another connection (or, for a password change, another session); or the password changed between the two steps. 251 for login and register, 252 for a password change. |
-| `USERNAME_TAKEN` | 252 | Register: the name is taken (any letter case). Has `field`. |
+| `USERNAME_TAKEN` | 252 | Register, or rename with `PATCH users/profile`: another account has the name (any letter case). Has `field`. |
 | `RATE_LIMITED` | 252 | A per-account limit ([API.md](API.md) section 1.7), or the one-account-per-day rule at registration. Has `retry_after`. |
 | `TOO_MANY_ATTEMPTS` | 252 | Too many failed passwords for a username from one address, or too many register/password-change challenges from one address. Has `retry_after`. |
 | `LIMIT_REACHED` | 252 | A DM request or invite would give the sender more than `MAX_PENDING_REQUESTS` pending requests sent, or the receiver more than that received. |
 | `CONNECTION_IN_USE` | 252 | This connection is logged in as another account. |
 | `TOO_MANY_CONNECTIONS` | 252 | The account already has `MAX_CONNECTIONS_PER_USER` logged-in connections, and this connection tried to use its session. (A login is never refused this way: it replaces the session.) |
-| `NOT_A_MEMBER` | 252 | Reading, writing, marking as read, inviting, summarizing or leaving a group you are not in. |
-| `NOT_A_GROUP` | 252 | Join, leave or invite on a DM you are in. |
+| `NOT_A_MEMBER` | 252 | Reading, writing, marking as read, inviting, listing invitees, summarizing or leaving a group you are not in. |
+| `NOT_A_GROUP` | 252 / 250 | Join, leave or invite on a DM you are in (252); `GET chat/{id}/invitees` on one (250). |
 | `ALREADY_MEMBER` | 252 | Joining a group you are in, or inviting one of its members. |
 | `ALREADY_INVITED` | 252 | Inviting someone who already has a pending invite to that group. |
 | `ALREADY_REQUESTED` | 252 | A DM to someone who has not answered your DM request yet. |
@@ -219,7 +223,7 @@ Every `error` code the backend sends:
 | `NOT_FOUND` | 253 | No call has this method and URL (also a URL id that is not a UUID); a protected call without credentials; or the chat or user was deleted while the call ran. |
 | `CHAT_NOT_FOUND` | 253 | No such chat. Also every DM you are not in, and DM requests that are not accepted yet, so nobody can tell other people's DMs from missing chats. |
 | `USER_NOT_FOUND` | 253 | No such user. |
-| `REQUEST_NOT_FOUND` | 253 | No such request, it is not yours to answer, or it was declined, cancelled or deleted with its group (those rows are deleted). |
+| `REQUEST_NOT_FOUND` | 253 | No such request, it is not yours to answer, or it was declined, cancelled or deleted with its group (those rows are deleted). For `POST chat/{id}/invite/accept` and `.../reject`: you have no pending invite to that group (also when you are already a member). |
 | `INTERNAL_ERROR` | 254 | A bug; the server logs it and keeps serving. |
 | `DATABASE_UNAVAILABLE` | 254 | PostgreSQL cannot be reached, a statement or lock wait took over 5 s, or a deadlock repeated. |
 | `AI_UNAVAILABLE` | 254 | Summaries are off or not set up, or the AI service refused the key or model, rate-limited the server, failed, timed out or could not be reached. Has `retry_after` when waiting can help. |
@@ -320,6 +324,10 @@ cover.
   `socketcord-login-v1,alice,...`. `<user_id>` in the password AuthMessage is
   the account's UUID in lower case with hyphens, as replies write it. The
   flows in `scram.py` do both.
+* The verifier depends on the password, salt and iterations only, never on
+  the username, so renaming an account (`PATCH users/profile`) keeps its
+  password. Afterwards only the new name logs in; a login challenge fetched
+  with the old name just before the rename fails with `251 INVALID_CREDENTIALS`.
 
 ### Login: `POST users/login` twice
 
@@ -512,7 +520,7 @@ its fields and an example: [API.md](API.md) section 4.
 
 ## 7. Calls
 
-The 11 calls of the frontend README and the 13 additional calls, each with
+The 11 calls of the frontend README and the 17 additional calls, each with
 its request fields, reply fields, errors, pushes and an example:
 [API.md](API.md) sections 2 and 3. Section 5 of API.md maps the replies onto
 the frontend's `chat_page.py`.

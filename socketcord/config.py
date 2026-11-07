@@ -80,7 +80,7 @@ class Config:
     reg_limit_ip_max: int = 1
     reg_limit_exempt: List[ipaddress._BaseNetwork] = field(default_factory=list)
 
-    dm_require_accept: bool = True        # DM requests must be accepted before a DM room exists
+    dm_require_accept: bool = False       # true: the first DM is a request the receiver must accept
 
     # AI chat summaries, GET chat/{id}/summary (socketcord/ai.py). The API key is
     # read by the Anthropic SDK from ANTHROPIC_API_KEY; it is never stored here.
@@ -129,7 +129,7 @@ class Config:
             reg_limit_device_max=_env_int("REG_LIMIT_DEVICE_MAX", 1),
             reg_limit_ip_max=_env_int("REG_LIMIT_IP_MAX", 1),
             reg_limit_exempt=_env_networks("REG_LIMIT_EXEMPT", ""),
-            dm_require_accept=_env_bool("DM_REQUIRE_ACCEPT", True),
+            dm_require_accept=_env_bool("DM_REQUIRE_ACCEPT", False),
             ai_provider=_env_choice("AI_PROVIDER", "auto", AI_PROVIDERS),
             ai_model=_env("AI_MODEL", "claude-opus-5-5"),
             ai_effort=_env_choice("AI_EFFORT", "low", AI_EFFORTS),

@@ -8,8 +8,9 @@ defaults, errors, pushes, and an example of each. It is written from the code
 The order of keys inside a JSON object means nothing, and the examples do not always show the
 server's order: the push examples list `path` first, while the server sends it last.
 
-The frontend README lists 11 calls (section 2). The backend serves 13 more (section 3); the team
-rule says those must be documented in full, and they are. The binary packet layout, the
+The frontend README lists 11 calls (section 2). The backend serves 17 more (section 3), and
+answers the summary by POST as well as GET; the team rule says those must be documented in full,
+and they are. The binary packet layout, the
 challenge-response math and the connection limits are in [PROTOCOL.md](PROTOCOL.md); the
 database is described in the [README](../README.md#database).
 
@@ -17,7 +18,7 @@ database is described in the [README](../README.md#database).
 | ------- | -------- |
 | [1. Conventions](#1-conventions) | requests, reply head, authentication, ids and time, common errors, text rules, rate limits, object shapes |
 | [2. The 11 calls of the frontend README](#2-the-11-calls-of-the-frontend-readme) | register, login, profile, info, chats, chat info, messages, send, DM, invite, password |
-| [3. Additional calls](#3-additional-calls) | logout, online, search, requests, accept/decline/cancel, create group, all groups, read, join, leave, AI summary |
+| [3. Additional calls](#3-additional-calls) | logout, online, search, requests, accept/decline/cancel, create group, all groups, read, join, leave, AI summary, a user's groups, invitees, accept/reject an invite by group |
 | [4. Server pushes](#4-server-pushes) | `event/message`, `presence`, `request`, `chat`, `group_created`, `group_updated`, `group_deleted`, `profile`, `session_revoked` |
 | [5. Frontend adapter](#5-frontend-adapter) | API objects to `chat_page.py`, and what the client must do |
 
@@ -27,13 +28,13 @@ All calls:
 | ------ | --- | ---- | ------------ | ------- |
 | POST | `users` | none | register (two steps) | 2.1 |
 | POST | `users/login` | none | log in (two steps) | 2.2 |
-| PATCH | `users/profile` | yes | set your name colours | 2.3 |
+| PATCH | `users/profile` | yes | change your username and/or name colours | 2.3 |
 | GET | `users/info` | yes | your account | 2.4 |
 | GET | `chats` | yes | the chats you are in | 2.5 |
 | GET | `chat/{chat_id}/info` | yes | a chat's details and members | 2.6 |
 | GET | `chat/{chat_id}/messages` | member | message history, with filters | 2.7 |
 | POST | `chat/{chat_id}/message` | member | send a message | 2.8 |
-| POST | `users/{user_id}/dm` | yes | send a DM (the first one is a request) | 2.9 |
+| POST | `users/{user_id}/dm` | yes | send a DM (the first one opens the room; a request only with `DM_REQUIRE_ACCEPT=true`) | 2.9 |
 | POST | `chat/{chat_id}/invite` | member | invite someone to a group | 2.10 |
 | PATCH | `users/profile/password` | yes | change your password (two steps) | 2.11 |
 | POST | `users/logout` | yes | end your session | 3.1 |
@@ -49,6 +50,11 @@ All calls:
 | POST | `chat/{chat_id}/join` | yes | join a group by yourself | 3.11 |
 | POST | `chat/{chat_id}/leave` | member | leave a group | 3.12 |
 | GET | `chat/{chat_id}/summary` | member | AI summary of a chat | 3.13 |
+| POST | `chat/{chat_id}/summary` | member | the same call by POST (the frontend README's method) | 3.13 |
+| GET | `users/{user_id}/groups` | yes | the groups a user is in | 3.14 |
+| GET | `chat/{chat_id}/invitees` | member | who you can invite to a group | 3.15 |
+| POST | `chat/{chat_id}/invite/accept` | invitee | accept your invite to that group | 3.16 |
+| POST | `chat/{chat_id}/invite/reject` | invitee | decline your invite to that group | 3.17 |
 
 ---
 
@@ -227,9 +233,9 @@ turns that limit off.
 | `MESSAGE_RATE_PER_MINUTE` | 60 a minute | 30 | `POST chat/{chat_id}/message`, `POST users/{user_id}/dm` (every DM) |
 | `REQUEST_RATE_PER_HOUR` | 120 an hour | 20 | `POST chat/{chat_id}/invite`, `POST users/{user_id}/dm` when it creates a DM request |
 | `GROUP_CREATE_PER_HOUR` | 20 an hour | 5 | `POST chats` |
-| `MEMBERSHIP_RATE_PER_MINUTE` | 30 a minute | 10 | `POST chat/{chat_id}/join`, `POST chat/{chat_id}/leave` |
-| `PROFILE_RATE_PER_MINUTE` | 10 a minute | 5 | `PATCH users/profile` |
-| `AI_SUMMARY_PER_MINUTE` | 4 a minute | 3 | `GET chat/{chat_id}/summary` |
+| `MEMBERSHIP_RATE_PER_MINUTE` | 30 a minute | 10 | `POST chat/{chat_id}/join`, `POST chat/{chat_id}/leave`, `POST chat/{chat_id}/invite/accept` |
+| `PROFILE_RATE_PER_MINUTE` | 10 a minute | 5 | `PATCH users/profile` (renames and colour changes) |
+| `AI_SUMMARY_PER_MINUTE` | 4 a minute | 3 | `GET` / `POST chat/{chat_id}/summary` |
 
 Other limits:
 
@@ -244,7 +250,8 @@ Other limits:
 * **Pending requests**: nobody may have more than `MAX_PENDING_REQUESTS` (100) pending DM requests
   and invites sent, or received: `252 LIMIT_REACHED`. `0` turns this cap off. It is checked when a
   request is sent, so lowering it leaves the requests that already exist in place.
-* Answering requests, marking as read, and every GET call except the summary have no limit.
+* Answering requests (except `POST chat/{chat_id}/invite/accept`, which counts as a join),
+  marking as read, and every GET call except the summary have no limit.
 
 ### 1.8 Object shapes
 
@@ -255,7 +262,7 @@ The same object has the same shape everywhere it appears.
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `user_id` | string | UUID |
-| `username` | string | 3–32 characters from `A–Z a–z 0–9 _ . -`; unique without regard to case |
+| `username` | string | 3–32 characters from `A–Z a–z 0–9 _ . -`; unique without regard to case. It can change (`PATCH users/profile`, `event/profile`): identify people by `user_id`. |
 | `text_color` | string | `"#rrggbb"` in lower case; default `"#171717"` |
 | `text_bg_color` | string | `"#rrggbb"` in lower case; default `"#f2f2f2"`; never equal to `text_color` |
 | `online` | boolean | the account has a logged-in connection (or lost its last one less than 2 s ago) |
@@ -626,47 +633,64 @@ Step 2:
 }
 ```
 
-### 2.3 `PATCH users/profile`: set your name colours
+### 2.3 `PATCH users/profile`: change your username and name colours
 
 Auth: yes.
 
-**Changed**: the profile is the two colours of the team's data model (User Text Color, User Text
-Background Color); there is no display name and no bio. The GUI draws every username in its
-owner's text colour on its owner's background colour.
+**Changed**: the profile is the username and the two colours of the team's data model (User Text
+Color, User Text Background Color); there is no display name and no bio. The GUI draws every
+username in its owner's text colour on its owner's background colour. `background` is accepted as
+another name for `text_bg_color` (the frontend README's word).
 
-**Request** (at least one field)
+**Request** (at least one of `username`, `text_color`, `text_bg_color`, `background`)
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
+| `username` | string | no | the new name: trimmed, then 3–32 characters from `A–Z a–z 0–9 _ . -`, the same rule as `POST users`. Unique without regard to case: a name someone else has (in any case) is refused; your own name in another case (`bob` → `Bob`) is fine, and so is your current name. |
 | `text_color` | string | no | `"#rrggbb"`, either letter case; stored in lower case |
 | `text_bg_color` | string | no | the same |
+| `background` | string | no | the same as `text_bg_color`. Sending both is allowed only with the same colour (letter case aside). |
 
-After the change the two colours must differ.
+After the change the two colours must differ. Everything sent is changed in one step: if
+anything is refused, nothing changes.
+
+**Effect of a rename**: the account, its id, its password, its session and every chat stay as they
+were; everything that shows the user (members, message senders, DM names, requests, the online
+list) shows the new name from now on. Stored system lines such as `"bob joined the group"` keep
+the old text. Log in with the new name afterwards (any letter case); the old name stops working at
+once, also for a login challenge fetched just before the rename, and someone else may register it.
+The password keeps working, because the challenge-response verifier does not depend on the name
+([PROTOCOL.md](PROTOCOL.md) section 4).
 
 **Reply**
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `user` | User | your account with the new colours |
+| `user` | User | your account with the new name and colours |
 
 **Errors**, checked in this order:
 
 | Status | Code | When |
 | ------ | ---- | ---- |
+| 250 | `INVALID_FIELD` | `username` is not a string, or is empty or over 64 characters after trimming, or has a control character (`field`: `"username"`) |
+| 250 | `INVALID_USERNAME` | `username` breaks the 3–32 `A–Z a–z 0–9 _ . -` rule (`field`: `"username"`) |
 | 250 | `INVALID_FIELD` | a colour is not a string, is longer than 7 characters, or is not `#` and 6 hex digits (`field` names it) |
-| 250 | `MISSING_FIELD` | neither field was sent (`field`: `"text_color"`) |
-| 250 | `INVALID_FIELD` | the text colour would equal the background colour (`field`: `"text_bg_color"` if it was sent, else `"text_color"`) |
+| 250 | `INVALID_FIELD` | `text_bg_color` and `background` are both sent with different colours (`field`: `"background"`) |
+| 250 | `MISSING_FIELD` | none of the four fields was sent (`field`: `"text_color"`) |
+| 250 | `INVALID_FIELD` | the text colour would equal the background colour (`field`: `"text_bg_color"` or `"background"`, whichever was sent; else `"text_color"`) |
+| 252 | `USERNAME_TAKEN` | another account has that name, in any letter case (`field`: `"username"`; the same error `POST users` gives) |
 | 252 | `RATE_LIMITED` | more than `PROFILE_RATE_PER_MINUTE` changes (section 1.7) |
 | 253 | `USER_NOT_FOUND` | the account no longer exists |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/profile` to every logged-in connection except this one (your other
-connections included).
+**Pushes**: `event/profile` (section 4.8) to every logged-in connection except this one (your
+other connections included), for a rename as for a colour change. `GET users/online` and later
+`event/presence` show the new name.
 
-**Example**
+**Example**: bob renames himself and changes his colours at once:
 
 ```json
-{"rid": 5, "text_color": "#FFFFFF", "text_bg_color": "#1F6FEB"}
+{"rid": 5, "username": "Bobby", "text_color": "#FFFFFF", "background": "#1F6FEB"}
 ```
 
 ```json
@@ -675,13 +699,30 @@ connections included).
   "method": "PATCH",
   "rid": 5,
   "user": {
-    "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
-    "username": "bob",
+    "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
+    "username": "Bobby",
     "text_color": "#ffffff",
     "text_bg_color": "#1f6feb",
     "online": true,
-    "created_at": "2026-11-06T14:10:59.447Z"
+    "created_at": "2026-11-07T07:22:23.959Z"
   }
+}
+```
+
+carol tries to take alice's name (in another case):
+
+```json
+{"rid": 5, "username": "ALICE"}
+```
+
+```json
+{
+  "path": "users/profile",
+  "method": "PATCH",
+  "rid": 5,
+  "error": "USERNAME_TAKEN",
+  "detail": "the name 'ALICE' is already taken",
+  "field": "username"
 }
 ```
 
@@ -1133,11 +1174,12 @@ connection that sent it (your other connections get it).
 
 Auth: yes. `{user_id}` is the person you write to.
 
-**Changed**: the README "sends a DM request with a message". The backend keeps one DM per pair of
-people (either direction). The first DM creates a **DM request** that carries your message; the
-DM room opens when the other person accepts it (the team's design: the other side must accept).
-After that, this call posts into the room. With `DM_REQUIRE_ACCEPT=false` on the server the room
-opens at once. The reply always has the same five keys.
+**Changed**: the backend keeps one DM per pair of people (either direction). By default
+(`DM_REQUIRE_ACCEPT=false`) a DM needs no approval: the first DM creates the room at once with your
+message, and later ones (from either of you) go into the same room. With `DM_REQUIRE_ACCEPT=true`
+on the server, the first DM instead creates a **DM request** that carries your message, and the
+room opens when the other person accepts it (section 3.5). The reply always has the same five
+keys.
 
 **Request**
 
@@ -1150,10 +1192,11 @@ opens at once. The reply always has the same five keys.
 | State | Result | `status` | `request` |
 | ----- | ------ | -------- | --------- |
 | an open DM room | your message is posted in it | `"sent"` | `null` |
+| no DM (default, `DM_REQUIRE_ACCEPT=false`) | the room is created and your message posted | `"sent"` | `null` |
+| no DM, `DM_REQUIRE_ACCEPT=true` | a pending DM request that carries your message | `"pending"` | the new request |
 | a pending request **they** sent you | your DM accepts it: the room opens with their first message and yours | `"sent"` | their request, now `"accepted"` |
-| a pending request **you** sent | refused: `252 ALREADY_REQUESTED` | | |
-| no DM, `DM_REQUIRE_ACCEPT=false` | the room is created and your message posted | `"sent"` | `null` |
-| no DM (default) | a pending DM request that carries your message | `"pending"` | the new request |
+| a pending request **you** sent, `DM_REQUIRE_ACCEPT=true` | refused: `252 ALREADY_REQUESTED` | | |
+| a pending request **you** sent, `DM_REQUIRE_ACCEPT=false` (left over from a time the server required approval) | it opens: the room starts with its first message, then yours | `"sent"` | your request, now `"accepted"` |
 
 **Reply**
 
@@ -1162,7 +1205,7 @@ opens at once. The reply always has the same five keys.
 | `status` | string | `"sent"` or `"pending"` |
 | `chat_id` | string or null | the DM room (`null` when pending) |
 | `chat` | Chat item or null | the room as it appears in your `GET chats` (`null` when pending) |
-| `messages` | list of Message | `"sent"` into a room: your message. `"sent"` because it accepted their request: the room's newest 20 messages, oldest first, which are their first message and yours. `[]` when pending. |
+| `messages` | list of Message | `"sent"` into a room (a new one included): your message. `"sent"` because a pending request opened: the room's newest 20 messages, oldest first, which are the request's first message and yours. `[]` when pending. |
 | `request` | Request or null | see the table above. A pending request's `request_id` is also the future room's `chat_id`. |
 
 **Errors**, checked in this order:
@@ -1172,9 +1215,9 @@ opens at once. The reply always has the same five keys.
 | 250 | `MISSING_FIELD`, `INVALID_FIELD` | `message` is missing, not a string, empty after trimming, over 4000 characters, or has a control character |
 | 250 | `INVALID_TARGET` | `{user_id}` is you |
 | 253 | `USER_NOT_FOUND` | no such user |
-| 252 | `RATE_LIMITED` | over `MESSAGE_RATE_PER_MINUTE` (every DM counts); when a request would be created, also over `REQUEST_RATE_PER_HOUR` |
-| 252 | `ALREADY_REQUESTED` | your earlier DM request to them is still pending |
-| 252 | `LIMIT_REACHED` | creating a request, but you already have `MAX_PENDING_REQUESTS` (100) pending requests sent, or they have 100 received |
+| 252 | `RATE_LIMITED` | over `MESSAGE_RATE_PER_MINUTE` (every DM counts); when a request would be created (`DM_REQUIRE_ACCEPT=true`), also over `REQUEST_RATE_PER_HOUR` |
+| 252 | `ALREADY_REQUESTED` | `DM_REQUIRE_ACCEPT=true` only: your earlier DM request to them is still pending |
+| 252 | `LIMIT_REACHED` | `DM_REQUIRE_ACCEPT=true` only: creating a request, but you already have `MAX_PENDING_REQUESTS` (100) pending requests sent, or they have 100 received |
 | 252 | `TRY_AGAIN` | the pair's DM changed three times while the call ran (the other person was accepting, cancelling or writing at that moment); send it again |
 | 253 | `NOT_FOUND` | the room or the other user disappeared while sending |
 | | common errors | section 1.5 |
@@ -1182,17 +1225,82 @@ opens at once. The reply always has the same five keys.
 **Pushes**:
 
 * Into an open room: `event/message` to the other person (and to your other connections).
-* Accepting their request: `event/chat` (`dm_opened`), then `event/message` with their first
-  message, both to every connection of both of you, this one included (here they arrive before
-  the reply); then `event/message` with yours to both of you except this connection; then
-  `event/request` (`accepted`) to them.
-* New room with `DM_REQUIRE_ACCEPT=false`: `event/chat` (`dm_opened`) to every connection of both
-  of you, this one included (before the reply), then `event/message` with your message to both of
-  you except this connection. Nothing older is replayed: the room starts with your message.
-* New request: `event/request` (`pending`) to them, only while the request is still pending
-  (section 4.3).
+* New room (the default): `event/chat` (`dm_opened`) to every connection of both of you, this one
+  included (before the reply), then `event/message` with your message to both of you except this
+  connection. Nothing older is replayed: the room starts with your message. These are the pushes
+  the receiver needs to add the DM to their chat list and show the message.
+* A pending request opens (theirs, or a left-over one of yours): `event/chat` (`dm_opened`), then
+  `event/message` with the request's first message, both to every connection of both of you, this
+  one included (here they arrive before the reply); then `event/message` with yours to both of you
+  except this connection; then `event/request` (`accepted`) to them.
+* New request (`DM_REQUIRE_ACCEPT=true`): `event/request` (`pending`) to them, only while the
+  request is still pending (section 4.3).
 
-**Example**. The first DM from alice to bob becomes a request:
+**Example**. By default the first DM from alice to carol opens the room at once:
+
+```json
+{"rid": 7, "message": "hi carol"}
+```
+
+```json
+{
+  "path": "users/50245c20-966f-4dc8-a71e-dfe2de0d9802/dm",
+  "method": "POST",
+  "rid": 7,
+  "status": "sent",
+  "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
+  "chat": {
+    "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
+    "kind": "dm",
+    "is_dm": true,
+    "name": "carol",
+    "description": "",
+    "role": "member",
+    "member_count": 2,
+    "unread": 0,
+    "last_read_message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
+    "last_message": {
+      "message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
+      "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
+      "kind": "text",
+      "content": "hi carol",
+      "created_at": "2026-11-07T07:22:24.082Z",
+      "sender": {
+        "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+        "username": "alice",
+        "text_color": "#171717",
+        "text_bg_color": "#f2f2f2"
+      }
+    },
+    "last_activity": "2026-11-07T07:22:24.082Z",
+    "peer": {
+      "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
+      "username": "carol",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2",
+      "online": true
+    }
+  },
+  "messages": [
+    {
+      "message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
+      "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
+      "kind": "text",
+      "content": "hi carol",
+      "created_at": "2026-11-07T07:22:24.082Z",
+      "sender": {
+        "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+        "username": "alice",
+        "text_color": "#171717",
+        "text_bg_color": "#f2f2f2"
+      }
+    }
+  ],
+  "request": null
+}
+```
+
+With `DM_REQUIRE_ACCEPT=true`, the first DM from alice to bob becomes a request:
 
 ```json
 {"rid": 27, "message": "hi bob, got a minute?"}
@@ -1294,7 +1402,8 @@ After bob accepted, alice writes again and it goes into the room:
 }
 ```
 
-carol had sent alice a DM request; alice answers with a DM of her own, which accepts it:
+With `DM_REQUIRE_ACCEPT=true`, carol had sent alice a DM request; alice answers with a DM of her
+own, which accepts it:
 
 ```json
 {"rid": 39, "message": "hey carol!"}
@@ -1595,8 +1704,10 @@ Step 2:
 
 ## 3. Additional calls
 
-These calls are not in the frontend README. They are needed by the course requirements (online
-list, groups, joining, DM requests) and by the GUI (logout, read markers, the AI summary).
+These calls are not among the README's first 11. They are needed by the course requirements
+(online list, groups, joining, DM requests) and by the GUI (logout, read markers, the AI summary,
+"See Groups" on a member, the "Add people" search, and the Accept / Reject buttons of an invite:
+sections 3.14 to 3.17).
 
 ### 3.1 `POST users/logout`: end your session
 
@@ -1804,7 +1915,8 @@ setting was lowered or turned off, or when several requests were sent at the sam
 
 ### 3.5 `POST users/requests/{request_id}/accept`: accept a DM request or invite
 
-Auth: the receiver (`to`) of the request.
+Auth: the receiver (`to`) of the request. An invite can also be accepted by its group's id
+(section 3.16).
 
 **Request**: no fields.
 
@@ -1907,7 +2019,8 @@ group's Chat info in `info`.
 
 ### 3.6 `POST users/requests/{request_id}/decline`: decline a DM request or invite
 
-Auth: the receiver (`to`) of the request.
+Auth: the receiver (`to`) of the request. An invite can also be declined by its group's id
+(section 3.17).
 
 **Request**: no fields.
 
@@ -2211,9 +2324,9 @@ Auth: yes. Course requirement R10: a client joins a group by itself.
 
 **Request**: no fields.
 
-**Effect**: you become a member. If you had a pending invite to this group, it becomes accepted.
-The system line `"<you> joined the group"` is added, and your read marker moves to the newest
-message.
+**Effect**: you become a member. If you had a pending invite to this group, it becomes accepted
+(the same as `POST chat/{chat_id}/invite/accept`, section 3.16). The system line
+`"<you> joined the group"` is added, and your read marker moves to the newest message.
 
 **Reply**
 
@@ -2362,6 +2475,10 @@ disappear without `event/request`.
 Auth: members only (the same check as `GET chat/{chat_id}/messages`). This is the rubric's Part 3
 feature; the README's "AI summary" section explains the design.
 
+**`POST chat/{chat_id}/summary`** (the method the frontend README lists) is the same call: the
+same request fields, reply, errors, rate limit and cache. Only the reply head's `method` says
+`"POST"`.
+
 **Request**
 
 | Field | Type | Default | Rules |
@@ -2494,6 +2611,408 @@ Nothing to summarize (`"unread"` with no unread messages):
 }
 ```
 
+### 3.14 `GET users/{user_id}/groups`: the groups a user is in
+
+Auth: yes. `{user_id}` is anyone's id, yours included (the GUI's "See Groups" on a member).
+
+Groups and their members are public on this server: `GET chats/groups` (section 3.9) shows every
+group with its member list to everyone logged in (R9). So this call lists every group the user is
+an accepted member of, whoever asks. Pending invites are not memberships and are not listed.
+
+**Request**: no fields.
+
+**Reply**
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `user_id` | string | `{user_id}` |
+| `user` | User ref + `online` | that user, with their current name and colours |
+| `count` | integer | number of entries in `groups` |
+| `groups` | list | every group they are in, by name without regard to case (then by `chat_id`); no paging |
+
+An entry of `groups`:
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `chat_id` | string | the group |
+| `kind`, `is_dm` | | always `"group"`, `false` |
+| `name`, `description`, `created_at` | | as in Group (section 1.8) |
+| `member_count` | integer | accepted members |
+| `role` | string | **that user's** role in it: `"owner"` (the creator) or `"member"` |
+| `joined_at` | timestamp | when **that user** joined it |
+| `joined` | boolean | **you** (the caller) are a member too |
+
+**Errors**
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| 253 | `USER_NOT_FOUND` | no such user |
+| 253 | `NOT_FOUND` | `{user_id}` is not a UUID ("no such call") |
+| | common errors | section 1.5 |
+
+**Pushes**: none. Keep a shown list current with `event/group_updated` (`joined` / `left`, whose
+`user` is that user) and `event/group_deleted`, or ask again.
+
+**Example**: carol asks for alice's groups:
+
+```json
+{
+  "path": "users/a5a12c62-a12b-4c9c-aa45-4e2fad035b70/groups",
+  "method": "GET",
+  "rid": 6,
+  "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+  "user": {
+    "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+    "username": "alice",
+    "text_color": "#171717",
+    "text_bg_color": "#f2f2f2",
+    "online": true
+  },
+  "count": 2,
+  "groups": [
+    {
+      "chat_id": "d423ebd8-5858-48d3-a1f7-878576ba8aaf",
+      "kind": "group",
+      "is_dm": false,
+      "name": "Book Club",
+      "description": "",
+      "created_at": "2026-11-07T07:22:24.080Z",
+      "member_count": 1,
+      "role": "owner",
+      "joined_at": "2026-11-07T07:22:24.080Z",
+      "joined": false
+    },
+    {
+      "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
+      "kind": "group",
+      "is_dm": false,
+      "name": "Network Project",
+      "description": "term project",
+      "created_at": "2026-11-07T07:22:24.080Z",
+      "member_count": 2,
+      "role": "owner",
+      "joined_at": "2026-11-07T07:22:24.080Z",
+      "joined": false
+    }
+  ]
+}
+```
+
+### 3.15 `GET chat/{chat_id}/invitees`: who you can invite to a group
+
+Auth: any member of the group. Feeds the GUI's "Add people" search; invite the picked person with
+`POST chat/{chat_id}/invite` (section 2.10).
+
+**Who is listed**: people who are **online now** (as in `GET users/online`) **or** have an
+**open DM with you** (an accepted DM room; a pending DM request does not count), whose username
+contains `query`, except:
+
+* you;
+* the group's members;
+* anyone with a pending invite to this group (from any member).
+
+Sorted by username without regard to case; at most 50 people.
+
+**Request**
+
+| Field | Type | Default | Rules |
+| ----- | ---- | ------- | ----- |
+| `query` | string | `""` | 0–32 characters after trimming. Matches usernames that contain it anywhere, ignoring case; `_`, `.`, `-` and `%` match themselves. `""` matches everyone. |
+
+**Reply**
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `chat_id` | string | the group |
+| `query` | string | the query as used (trimmed) |
+| `count` | integer | number of entries in `users` |
+| `users` | list | each `{"user_id", "username", "text_color", "text_bg_color", "online"}` (a User without `created_at`); at most 50 |
+
+**Errors**, checked in this order:
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
+| 250 | `NOT_A_GROUP` | the chat is a DM you are in ("only groups take invites") |
+| 252 | `NOT_A_MEMBER` | you are not in the group |
+| 250 | `INVALID_FIELD` | `query` is not a string, is over 32 characters, or has a control character (`field`: `"query"`) |
+| | common errors | section 1.5 |
+
+**Pushes**: none. The list is a snapshot: someone may come online, or be invited by another
+member, a moment later. `POST chat/{chat_id}/invite` still checks everything (an already invited
+person gives `252 ALREADY_INVITED`).
+
+**Example**: alice (in "Network Project" with Bobby) searches with an empty query; carol and dave
+are online:
+
+```json
+{"rid": 8, "query": ""}
+```
+
+```json
+{
+  "path": "chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invitees",
+  "method": "GET",
+  "rid": 8,
+  "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
+  "query": "",
+  "count": 2,
+  "users": [
+    {
+      "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
+      "username": "carol",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2",
+      "online": true
+    },
+    {
+      "user_id": "c2cd251f-8294-4fd9-ba19-0601dcd08fdd",
+      "username": "dave",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2",
+      "online": true
+    }
+  ]
+}
+```
+
+With `{"query": "CA"}` only carol is left. dave, who is not a member, gets:
+
+```json
+{
+  "path": "chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invitees",
+  "method": "GET",
+  "rid": 7,
+  "error": "NOT_A_MEMBER",
+  "detail": "join this group first"
+}
+```
+
+### 3.16 `POST chat/{chat_id}/invite/accept`: accept your invite to a group
+
+Auth: yes; you must have a pending invite to the group.
+
+The same as `POST users/requests/{request_id}/accept` (section 3.5) on that invite, addressed by
+the group's `chat_id` instead of the invite's `request_id`, and the same as joining the group by
+yourself while invited (section 3.11).
+
+**Request**: no fields.
+
+**Effect**: the invite becomes your membership. The system line `"<you> joined the group"` is
+added, and your read marker moves to the newest message, so the history from before you joined
+is not unread.
+
+**Reply**: the reply of `POST chat/{chat_id}/join`, plus the accepted invite.
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `chat` | Chat item | the group as it appears in your `GET chats` |
+| `info` | Chat info | the group's details and members, exactly as `GET chat/{chat_id}/info` returns them (with `invited`, `invited_count` and `invited_truncated`) |
+| `request` | Request | the invite, `status` `"accepted"`, with `responded_at` |
+
+**Errors**, checked in this order:
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
+| 253 | `REQUEST_NOT_FOUND` | you have no pending invite to this chat: never invited; the invite was declined, cancelled or deleted with its group; you are already a member ("you are already in this group; there is no invitation to answer"); or the chat is a DM you are in. Remove the invite from the list. |
+| 252 | `RATE_LIMITED` | more than `MEMBERSHIP_RATE_PER_MINUTE` joins, leaves and accepted invites (section 1.7) |
+| 253 | `REQUEST_NOT_FOUND` | the inviter cancelled it at that very moment ("the invitation was cancelled or answered a moment ago") |
+| 253 | `NOT_FOUND` | `{chat_id}` is not a UUID ("no such call"), or the group was deleted meanwhile |
+| | common errors | section 1.5 |
+
+**Pushes**: the same as accepting an invite in section 3.5: `event/message` (the system line) to
+every online member except this connection, `event/group_updated` (`joined`) to everyone, this
+connection included, and `event/request` (`accepted`) to the inviter.
+
+**Example**: carol accepts alice's invite to "Network Project"
+(`POST chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invite/accept`, empty message):
+
+```json
+{
+  "path": "chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invite/accept",
+  "method": "POST",
+  "rid": 7,
+  "chat": {
+    "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
+    "kind": "group",
+    "is_dm": false,
+    "name": "Network Project",
+    "description": "term project",
+    "role": "member",
+    "member_count": 3,
+    "unread": 0,
+    "last_read_message_id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
+    "last_message": {
+      "message_id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
+      "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
+      "kind": "system",
+      "content": "carol joined the group",
+      "created_at": "2026-11-07T07:22:24.101Z",
+      "sender": null
+    },
+    "last_activity": "2026-11-07T07:22:24.101Z"
+  },
+  "info": {
+    "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
+    "kind": "group",
+    "is_dm": false,
+    "name": "Network Project",
+    "description": "term project",
+    "created_by": {
+      "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+      "username": "alice",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2"
+    },
+    "created_at": "2026-11-07T07:22:24.080Z",
+    "member_count": 3,
+    "online_count": 3,
+    "members": [
+      {
+        "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+        "username": "alice",
+        "text_color": "#171717",
+        "text_bg_color": "#f2f2f2",
+        "role": "owner",
+        "joined_at": "2026-11-07T07:22:24.080Z",
+        "online": true
+      },
+      {
+        "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
+        "username": "Bobby",
+        "text_color": "#ffffff",
+        "text_bg_color": "#1f6feb",
+        "role": "member",
+        "joined_at": "2026-11-07T07:22:24.081Z",
+        "online": true
+      },
+      {
+        "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
+        "username": "carol",
+        "text_color": "#171717",
+        "text_bg_color": "#f2f2f2",
+        "role": "member",
+        "joined_at": "2026-11-07T07:22:24.101Z",
+        "online": true
+      }
+    ],
+    "members_truncated": false,
+    "joined": true,
+    "last_read_message_id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
+    "invited": [],
+    "invited_count": 0,
+    "invited_truncated": false
+  },
+  "request": {
+    "request_id": "e11125d6-a6d7-4aad-9cd0-5f123b0ce93d",
+    "kind": "invite",
+    "status": "accepted",
+    "from": {
+      "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+      "username": "alice",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2"
+    },
+    "to": {
+      "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
+      "username": "carol",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2"
+    },
+    "created_at": "2026-11-07T07:22:24.101Z",
+    "responded_at": "2026-11-07T07:22:24.101Z",
+    "chat": {"chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030", "name": "Network Project"}
+  }
+}
+```
+
+Asking again, now that carol is a member:
+
+```json
+{
+  "path": "chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invite/accept",
+  "method": "POST",
+  "rid": 8,
+  "error": "REQUEST_NOT_FOUND",
+  "detail": "you are already in this group; there is no invitation to answer"
+}
+```
+
+### 3.17 `POST chat/{chat_id}/invite/reject`: decline your invite to a group
+
+Auth: yes; you must have a pending invite to the group.
+
+The same as `POST users/requests/{request_id}/decline` (section 3.6) on that invite, addressed by
+the group's `chat_id`.
+
+**Request**: no fields.
+
+**Effect**: the invite is deleted; you do not join. Any member may invite you again later.
+
+**Reply**
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `chat_id` | string | the group |
+| `status` | string | always `"declined"` |
+| `request` | Request | the invite, `status` `"declined"`, with `responded_at` |
+
+**Errors**, checked in this order:
+
+| Status | Code | When |
+| ------ | ---- | ---- |
+| 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
+| 253 | `REQUEST_NOT_FOUND` | you have no pending invite to this chat (as in section 3.16), or it was cancelled or answered at that very moment |
+| 253 | `NOT_FOUND` | `{chat_id}` is not a UUID ("no such call") |
+| | common errors | section 1.5 |
+
+**Pushes**: `event/request` (`declined`) to the inviter.
+
+**Example**: dave declines alice's invite to "Book Club":
+
+```json
+{
+  "path": "chat/d423ebd8-5858-48d3-a1f7-878576ba8aaf/invite/reject",
+  "method": "POST",
+  "rid": 5,
+  "chat_id": "d423ebd8-5858-48d3-a1f7-878576ba8aaf",
+  "status": "declined",
+  "request": {
+    "request_id": "a977db68-dc0b-4282-949b-1611910a6b5b",
+    "kind": "invite",
+    "status": "declined",
+    "from": {
+      "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+      "username": "alice",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2"
+    },
+    "to": {
+      "user_id": "c2cd251f-8294-4fd9-ba19-0601dcd08fdd",
+      "username": "dave",
+      "text_color": "#171717",
+      "text_bg_color": "#f2f2f2"
+    },
+    "created_at": "2026-11-07T07:22:24.102Z",
+    "responded_at": "2026-11-07T07:22:24.102Z",
+    "chat": {"chat_id": "d423ebd8-5858-48d3-a1f7-878576ba8aaf", "name": "Book Club"}
+  }
+}
+```
+
+Again, with nothing left to decline:
+
+```json
+{
+  "path": "chat/d423ebd8-5858-48d3-a1f7-878576ba8aaf/invite/reject",
+  "method": "POST",
+  "rid": 6,
+  "error": "REQUEST_NOT_FOUND",
+  "detail": "you have no pending invitation to this group"
+}
+```
+
 ---
 
 ## 4. Server pushes
@@ -2609,12 +3128,15 @@ acting connection included, right after `event/chat`.
 
 | Cause | To | `status` |
 | ----- | -- | -------- |
-| `POST users/{user_id}/dm` creates a DM request | the receiver | `"pending"` |
+| `POST users/{user_id}/dm` creates a DM request (`DM_REQUIRE_ACCEPT=true`) | the receiver | `"pending"` |
 | `POST chat/{chat_id}/invite` | the invited user | `"pending"` |
 | `POST users/requests/{request_id}/accept` | the sender | `"accepted"` |
 | `POST users/requests/{request_id}/decline` | the sender | `"declined"` |
 | `POST users/requests/{request_id}/cancel` | the receiver | `"cancelled"` |
+| `POST chat/{chat_id}/invite/accept` | the inviter | `"accepted"` |
+| `POST chat/{chat_id}/invite/reject` | the inviter | `"declined"` |
 | the receiver of a pending DM request sends the sender a DM, which accepts it | the sender | `"accepted"` |
+| with `DM_REQUIRE_ACCEPT=false`, the sender of a left-over pending DM request sends another DM, which opens it | the receiver | `"accepted"` |
 | the invited user joins the group by themselves | the inviter | `"accepted"` |
 
 The answering user's own other connections are not told. A `"pending"` push is sent only while
@@ -2681,8 +3203,9 @@ is deleted, its pending invites disappear without this push: drop the invites wh
 
 ### 4.4 `event/chat`: a DM room opened
 
-**When**: the receiver accepts a DM request; the receiver of a pending DM request writes back
-(`POST users/{user_id}/dm`); or, with `DM_REQUIRE_ACCEPT=false`, the first DM between two people.
+**When**: the first DM between two people (`POST users/{user_id}/dm` with the default
+`DM_REQUIRE_ACCEPT=false`); or a pending DM request opens: its receiver accepts it or writes back,
+or (with `DM_REQUIRE_ACCEPT=false`) its sender writes again.
 
 **To**: every logged-in connection of both people, the acting connection included, each person
 with the chat as it appears in their own `GET chats`. It always arrives before the room's first
@@ -2779,8 +3302,9 @@ alice's copy when bob accepts her DM request (her first message is already read 
 
 ### 4.6 `event/group_updated`: someone joined or left a group
 
-**When**: a join (`POST chat/{chat_id}/join`, or accepting an invite) or a leave that does not
-delete the group. **To**: everyone, the actor included.
+**When**: a join (`POST chat/{chat_id}/join`, or accepting an invite with
+`POST users/requests/{request_id}/accept` or `POST chat/{chat_id}/invite/accept`) or a leave that
+does not delete the group. **To**: everyone, the actor included.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -2821,20 +3345,26 @@ everyone, the actor included.
 {"path": "event/group_deleted", "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4"}
 ```
 
-### 4.8 `event/profile`: someone changed their colours
+### 4.8 `event/profile`: someone changed their name or colours
 
-**When**: `PATCH users/profile`. **To**: everyone except the acting connection.
+**When**: `PATCH users/profile` (a rename, a colour change, or both). **To**: everyone except the
+acting connection.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `user` | User without `created_at` | with the new colours |
+| `user` | User without `created_at` | with the new username and colours |
+
+Find the person by `user_id`, not by name: after a rename `username` is new. Update every place
+that shows them (member lists, message senders, the name of your DM with them, the online list).
+
+alice's copy when bob renames himself to Bobby and changes his colours (section 2.3):
 
 ```json
 {
   "path": "event/profile",
   "user": {
-    "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
-    "username": "bob",
+    "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
+    "username": "Bobby",
     "text_color": "#ffffff",
     "text_bg_color": "#1f6feb",
     "online": true
@@ -2880,7 +3410,7 @@ the client has to do so that the server's view and the GUI agree.
 
 | `chat_page.py` method | Feed it from | Mapping |
 | --------------------- | ------------ | ------- |
-| `set_user_style(username, text_color, background)` | any User, User ref or Member: the login reply's `user`, `members`, message `sender`, `event/profile`, `event/presence` | `(u["username"], u["text_color"], u["text_bg_color"])`. Call it before `set_members` / `set_messages`, since it redraws them. |
+| `set_user_style(username, text_color, background)` | any User, User ref or Member: the login reply's `user`, `members`, message `sender`, `event/profile`, `event/presence` | `(u["username"], u["text_color"], u["text_bg_color"])`. Call it before `set_members` / `set_messages`, since it redraws them. After a rename (`event/profile`) the old name is gone: look the person up by `user_id`. |
 | `set_profile(username)` | the login reply's `user` (or `GET users/info`) | `user["username"]` |
 | `set_chats(chats, selected_id)` | `GET chats` → `chats` | each Chat item already has `chat_id`, `name`, `unread`, `is_dm` and `last_activity`; convert `last_activity` to a `datetime` (below). The GUI adds `[DM]` in front of DM names itself. |
 | `set_members(members)` | `GET chat/{chat_id}/info` → `chat["members"]` | `{"username": m["username"], "online": m["online"], "is_me": m["user_id"] == my_user_id}`. Pending invites (`chat["invited"]`) have no place in the current GUI. |
@@ -2921,14 +3451,17 @@ The GUI's placeholder hooks map to these calls:
 
 | Hook in `chat_page.py` | Call |
 | ---------------------- | ---- |
-| `edit_profile` | `PATCH users/profile` |
-| `change_password` | `PATCH users/profile/password` with `ChangePasswordFlow` (its docstring says `users/profile`), then `RequestCord.set_auth(user_id, session_token)` |
+| `edit_profile` / `request_edit_profile(username, text_color, background)` | `PATCH users/profile` with `{"username", "text_color", "background"}` (send only what changed; `background` = `text_bg_color`) |
+| `change_password` / `request_change_password` | `PATCH users/profile/password` with `ChangePasswordFlow` (two steps; never a `password` field), then `RequestCord.set_auth(user_id, session_token)` |
 | `logout` | `POST users/logout`, then `RequestCord.clear_auth()` and the login page |
 | `new_group` | `POST chats`; add the reply's `chat` to the list |
-| `add_people_to_group` | `GET users/search` or `GET users/online` to pick someone, then `POST chat/{chat_id}/invite` |
+| `add_people_to_group` / `request_invitees(chat_id, query)` | `GET chat/{chat_id}/invitees` with `{"query"}`, then `POST chat/{chat_id}/invite` with the picked `user_id` |
+| `request_user_groups(username)` ("See Groups") | `GET users/{user_id}/groups` with the member's `user_id` (from the member list); `groups` → `[{"chat_id", "name"}]` |
+| `request_accept_invite(chat_id)` / `request_reject_invite(chat_id)` | `POST chat/{chat_id}/invite/accept` / `.../invite/reject` |
+| `request_message(username, greeting)` | `POST users/{user_id}/dm` with `{"message": greeting}`; with the default settings it opens (or reuses) the DM at once |
 | `send_message` | `POST chat/{chat_id}/message`; `clear_input()` and `append_message()` on 200 |
 | `select_chat(chat_id)` | `GET chat/{chat_id}/info` and `GET chat/{chat_id}/messages`, then `POST chat/{chat_id}/read` |
-| `generate_summary` | `GET chat/{chat_id}/summary` |
+| `generate_summary` | `GET` (or `POST`) `chat/{chat_id}/summary` |
 
 ### 5.2 Client duties
 
@@ -2947,13 +3480,14 @@ The GUI's placeholder hooks map to these calls:
 4. **Pending requests and invites.** After login, `GET users/requests` and show `incoming`
    (accept, decline) and `outgoing` (cancel). Keep the list current with `event/request`
    (`pending`: add; `accepted`, `declined`, `cancelled`: remove), and remove invites whose
-   `chat.chat_id` arrives in `event/group_deleted`. After accepting, add the reply's `chat` to the
+   `chat.chat_id` arrives in `event/group_deleted`. An invite can be answered by its group too
+   (`POST chat/{chat_id}/invite/accept` / `reject`). After accepting, add the reply's `chat` to the
    chat list. An accepted DM request also arrives as `event/chat` on every connection of both
    people, the accepting connection included (there it comes before the reply).
-5. **`DM_REQUIRE_ACCEPT=false` until that panel exists.** With the default (`true`), a first DM
-   becomes a request the other person cannot see in the current GUI. Set
-   `DM_REQUIRE_ACCEPT=false` in the server's `.env` until the GUI shows requests; the first DM then
-   opens the room at once.
+5. **DMs open at once by default.** With the default `DM_REQUIRE_ACCEPT=false`, the first DM
+   creates the room (`event/chat` reaches both people) and nothing waits for approval. A server
+   run with `DM_REQUIRE_ACCEPT=true` turns the first DM into a request that the receiver must
+   accept (item 4).
 6. **A long timeout for the summary.** Wait up to 90 s for `GET chat/{chat_id}/summary`, or send
    it on a second connection that uses the same User ID and Session Token (never `users/login`
    there). The connection's other requests wait behind it.
@@ -2968,8 +3502,8 @@ The GUI's placeholder hooks map to these calls:
    (unless you sent it) and move it to the top with the new `last_activity`. A chat is added (or
    replaced, if it is listed already) by `event/chat`, which reaches every connection of both
    people, the acting one included, and by the replies of `POST chats`,
-   `POST chat/{chat_id}/join`, `POST users/requests/{request_id}/accept` and
-   `POST users/{user_id}/dm` (status `"sent"`). Your other connections learn about a group you
+   `POST chat/{chat_id}/join`, `POST chat/{chat_id}/invite/accept`,
+   `POST users/requests/{request_id}/accept` and `POST users/{user_id}/dm` (status `"sent"`). Your other connections learn about a group you
    created or joined on another connection from `event/group_created` whose `created_by` is you
    and `event/group_updated` `"joined"` whose `user` is you; neither carries a Chat item, so fetch
    the row with `GET chats`. The leave reply, `event/group_updated` `"left"` whose `user` is you,

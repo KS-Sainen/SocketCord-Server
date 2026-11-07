@@ -183,7 +183,8 @@ def test_control_characters_are_refused_in_names_but_newlines_ok_in_messages(ser
     assert c.request(POST, f"chat/{gid}/message", {"content": "bell\u0007"}).status == 250
 
 
-def test_simultaneous_dms_end_in_one_room_with_both_messages(server):
+def test_simultaneous_dms_end_in_one_room_with_both_messages(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("cross_a"), server.user("cross_b")
     barrier = threading.Barrier(2)
     replies = {}
@@ -215,7 +216,8 @@ def test_invite_is_settled_when_the_invitee_joins_by_themselves(server):
     a.wait_event("request", match=lambda d: d["request"]["status"] == "accepted")
 
 
-def test_non_members_cannot_tell_a_dm_from_a_missing_chat(server):
+def test_non_members_cannot_tell_a_dm_from_a_missing_chat(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b, outsider = server.user("dm_a"), server.user("dm_b"), server.user("outsider")
     rid = a.post(f"users/{b.user_id}/dm", {"message": "hi"})["request"]["request_id"]
     dm_id = b.post(f"users/requests/{rid}/accept")["chat"]["chat_id"]
@@ -231,7 +233,8 @@ def _arrival_order(client, wanted):
         return [e.path for e in client._events if e.path in wanted]
 
 
-def test_new_dm_room_is_announced_before_its_first_message(server):
+def test_new_dm_room_is_announced_before_its_first_message(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("order_a"), server.user("order_b")
     rid = a.post(f"users/{b.user_id}/dm", {"message": "first"})["request"]["request_id"]
     a.drain_events()

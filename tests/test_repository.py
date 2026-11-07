@@ -20,9 +20,9 @@ import pytest
 from socketcord import scram
 from socketcord.db.base import (DEFAULT_TEXT_BG_COLOR, DEFAULT_TEXT_COLOR, NO_MESSAGE, AlreadyMember,
                                 AlreadyRequested, Chat, ChatListItem, ChatRequest, GroupListItem,
-                                JoinResult, Member, Message, MessageQuery, NotFoundError, RateLimited,
-                                RegistrationLimit, RegistrationRule, Repository, SameColors, Session,
-                                User, UserRef, UsernameTaken, message_time)
+                                JoinResult, Member, MemberGroup, Message, MessageQuery, NotFoundError,
+                                RateLimited, RegistrationLimit, RegistrationRule, Repository, SameColors,
+                                Session, User, UserRef, UsernameTaken, message_time)
 
 DAY = 24 * 3600
 TICK = 0.003        # pause between steps whose order a test reads back from timestamps
@@ -253,6 +253,63 @@ def test_embedded_users_show_the_current_profile(repo):
     assert repo.get_chat_item(ann.user_id, g.chat_id).last_message.sender == ref(ann)
     invite = repo.create_request("invite", ann.user_id, ben.user_id, chat_id=g.chat_id)
     assert invite.sender == ref(ann) and invite.receiver == ref(ben)
+
+
+def test_update_profile_renames_without_regard_to_case(repo):
+    alice, bob = make_user(repo, "alice"), make_user(repo, "Bob")
+    renamed = repo.update_profile(alice.user_id, None, None, username="Alicia")
+    assert renamed.username == "Alicia"
+    assert (renamed.user_id, renamed.password_hash, renamed.text_color, renamed.text_bg_color, renamed.created_at) \
+        == (alice.user_id, alice.password_hash, alice.text_color, alice.text_bg_color, alice.created_at)
+    assert repo.get_user(alice.user_id) == renamed
+    assert repo.get_user_by_username("ALICIA") == renamed
+    assert repo.get_user_by_username("alice") is None                  # the old name is gone ...
+    assert search(repo, "ali") == (["Alicia"], False)
+    own_case = repo.update_profile(alice.user_id, None, None, username="ALICIA")   # your own name, other case
+    assert own_case.username == "ALICIA" and repo.get_user_by_username("alicia") == own_case
+    assert repo.update_profile(alice.user_id, None, None, username="ALICIA") == own_case   # no change at all
+    for clash in ("Bob", "bob", "BOB"):
+        with pytest.raises(UsernameTaken):
+            repo.update_profile(alice.user_id, "#ff0000", None, username=clash)
+    assert repo.get_user(alice.user_id) == own_case                    # nothing changed, the colour neither
+    newcomer = make_user(repo, "alice")                                # ... and free for someone else
+    assert repo.get_user_by_username("Alice") == newcomer
+    with pytest.raises(UsernameTaken):
+        repo.update_profile(bob.user_id, None, None, username="aLiCe")
+    both = repo.update_profile(bob.user_id, "#123456", "#abcdef", username="Bobby")
+    assert (both.username, both.text_color, both.text_bg_color) == ("Bobby", "#123456", "#abcdef")
+    assert repo.get_user_by_username("bob") is None and repo.get_user_by_username("bobby") == both
+    assert repo.update_profile(uuid.uuid4(), None, None, username="ghost") is None
+
+
+def test_update_profile_refuses_names_the_schema_refuses(repo):
+    user = make_user(repo, "namer")
+    for bad in ("ab", "has space", "x" * 33, "semi;colon", "", "naïve"):
+        with pytest.raises(ValueError):
+            repo.update_profile(user.user_id, None, None, username=bad)
+    assert repo.get_user(user.user_id) == user
+
+
+def test_update_profile_checks_the_colours_before_the_name(repo):
+    user, other = make_user(repo, "first_check"), make_user(repo, "taken_name")
+    with pytest.raises(SameColors):
+        repo.update_profile(user.user_id, "#000000", "#000000", username="taken_name")
+    assert repo.get_user(user.user_id) == user and repo.get_user(other.user_id) == other
+
+
+def test_renamed_users_show_the_new_name_everywhere(repo):
+    ann, ben = make_user(repo, "ann_old"), make_user(repo, "ben_old")
+    g = repo.create_group("names", "", ann.user_id)
+    repo.add_message(g.chat_id, ann.user_id, "hi")
+    dm, _ = repo.create_dm(ben.user_id, ann.user_id)
+    invite = repo.create_request("invite", ann.user_id, ben.user_id, chat_id=g.chat_id)
+    ann = repo.update_profile(ann.user_id, None, None, username="ann_new")
+    [listed], _ = repo.list_messages(g.chat_id, MessageQuery())
+    assert listed.sender == ref(ann) and listed.sender.username == "ann_new"
+    assert repo.get_member(g.chat_id, ann.user_id).username == "ann_new"
+    assert repo.get_chat_item(ben.user_id, dm.chat_id).peer == ref(ann)
+    assert repo.get_request(invite.request_id).sender == ref(ann)
+    assert repo.get_users([ann.user_id]) == {ann.user_id: ann}
 
 
 # ---------------------------------------------------------------------- registration limits
@@ -861,6 +918,7 @@ def test_list_messages_pages_back_from_the_newest(repo):
     assert page(repo, g.chat_id, count=4, before_id=m[6]) == (m[2:6], True)
     assert page(repo, g.chat_id, count=4, before_id=m[2]) == (m[:2], False)
     assert page(repo, g.chat_id, count=10) == (m, False)
+    assert page(repo, g.chat_id, count=15) == (m, False)                # more than there are: all of them
     assert page(repo, g.chat_id, count=1) == (m[9:], True)
     assert page(repo, g.chat_id, count=4, before_id=between(m[6], m[7])) == (m[3:7], True)
     assert page(repo, g.chat_id, count=4, before_id=m[0]) == ([], False)
@@ -880,6 +938,7 @@ def test_list_messages_pages_forward_from_after_id(repo):
     assert not MessageQuery(after_id=m[1], before_id=m[8]).ascending
     assert page(repo, g.chat_id, count=3, after_id=m[1], before_id=m[8]) == (m[5:8], True)
     assert page(repo, g.chat_id, count=6, after_id=m[1], before_id=m[8]) == (m[2:8], False)
+    assert page(repo, g.chat_id, count=8, after_id=m[1], before_id=m[8]) == (m[2:8], False)
 
 
 def test_list_messages_content_search_is_literal_and_case_insensitive(repo):
@@ -1405,3 +1464,94 @@ def test_list_pending_invites_with_total(repo):
     assert repo.list_pending_invites(g.chat_id, limit=1) == ([inv1], 1)
     assert repo.list_pending_invites(other.chat_id)[1] == 1
     assert repo.list_pending_invites(uuid.uuid4()) == ([], 0)
+
+
+def test_list_member_groups_by_name_with_roles_and_counts(repo):
+    me, x, y = make_user(repo, "mg_me"), make_user(repo, "mg_x"), make_user(repo, "mg_y")
+    zeta = repo.create_group("zeta", "", x.user_id)
+    alpha = repo.create_group("Alpha", "the first", me.user_id)
+    beta = repo.create_group("beta", "", x.user_id)
+    thai = repo.create_group("กลุ่มเรียน", "", y.user_id)
+    repo.create_group("not mine", "", y.user_id)
+    invited = repo.create_group("invited only", "", y.user_id)
+    dup1 = repo.create_group("dup", "", me.user_id)
+    dup2 = repo.create_group("DUP", "", me.user_id)
+    for g in (zeta, beta, thai):
+        repo.join_group(g.chat_id, me.user_id)
+    repo.join_group(beta.chat_id, y.user_id)
+    repo.create_request("invite", y.user_id, me.user_id, chat_id=invited.chat_id)   # pending: not a group of mine
+    repo.create_dm(me.user_id, x.user_id)                                            # a DM is no group
+
+    rows = repo.list_member_groups(me.user_id)
+    assert all(isinstance(r, MemberGroup) for r in rows)
+    dups = sorted([dup1.chat_id, dup2.chat_id])
+    assert [r.chat.chat_id for r in rows] == [alpha.chat_id, beta.chat_id, *dups, zeta.chat_id, thai.chat_id]
+    by_id = {r.chat.chat_id: r for r in rows}
+    assert by_id[alpha.chat_id].chat == repo.get_chat(alpha.chat_id)
+    assert [(by_id[g.chat_id].role, by_id[g.chat_id].member_count) for g in (alpha, beta, zeta, thai)] == \
+        [("owner", 1), ("member", 3), ("member", 2), ("member", 2)]
+    assert by_id[beta.chat_id].joined_at == repo.get_member(beta.chat_id, me.user_id).joined_at
+    assert not any(r.viewer_is_member for r in rows)                                  # no viewer given
+    seen_by_x = {r.chat.chat_id: r.viewer_is_member for r in repo.list_member_groups(me.user_id, x.user_id)}
+    assert seen_by_x == {alpha.chat_id: False, beta.chat_id: True, dup1.chat_id: False, dup2.chat_id: False,
+                         zeta.chat_id: True, thai.chat_id: False}
+    assert all(r.viewer_is_member for r in repo.list_member_groups(me.user_id, me.user_id))
+    assert [r.chat.chat_id for r in repo.list_member_groups(x.user_id)] == [beta.chat_id, zeta.chat_id]
+    assert repo.list_member_groups(uuid.uuid4()) == []
+    repo.remove_member(zeta.chat_id, me.user_id)
+    assert zeta.chat_id not in {r.chat.chat_id for r in repo.list_member_groups(me.user_id)}
+    repo.update_profile(x.user_id, None, None, username="mg_x_renamed")                # rows follow the user id
+    assert [r.chat.chat_id for r in repo.list_member_groups(x.user_id)] == [beta.chat_id, zeta.chat_id]
+
+
+def test_find_invitees_online_people_and_dm_peers_minus_the_group(repo):
+    me = make_user(repo, "inv_me")
+    on1, on2 = make_user(repo, "inv_online1"), make_user(repo, "Inv_Online2")
+    peer = make_user(repo, "inv_peer")                   # offline, an open DM with me (they started it)
+    pending_peer = make_user(repo, "inv_pending")        # offline, only a DM request
+    stranger = make_user(repo, "inv_stranger")           # offline, no DM with me
+    member = make_user(repo, "inv_member")               # online, already in the group
+    invited = make_user(repo, "inv_invited")             # online, already invited
+    other_dm = make_user(repo, "inv_otherdm")            # offline, a DM with someone else
+    g = repo.create_group("invitees", "", me.user_id)
+    repo.join_group(g.chat_id, member.user_id)
+    invite = repo.create_request("invite", member.user_id, invited.user_id, chat_id=g.chat_id)
+    repo.create_dm(peer.user_id, me.user_id)
+    repo.create_request("dm", me.user_id, pending_peer.user_id, message="hi")
+    repo.create_dm(other_dm.user_id, stranger.user_id)
+    online = [me.user_id, on1.user_id, on2.user_id, member.user_id, invited.user_id, uuid.uuid4()]
+
+    def names(*args, **kw) -> List[str]:
+        return [u.username for u in repo.find_invitees(g.chat_id, me.user_id, *args, **kw)]
+
+    found = repo.find_invitees(g.chat_id, me.user_id, online)
+    assert [u.username for u in found] == ["inv_online1", "Inv_Online2", "inv_peer"]
+    assert all(isinstance(u, User) for u in found) and found[2] == repo.get_user(peer.user_id)
+    assert names(online, "ONLINE") == ["inv_online1", "Inv_Online2"]          # ignoring case
+    assert names(online, "line2") == ["Inv_Online2"]                          # anywhere in the name
+    assert names(online, "_peer") == ["inv_peer"]                             # "_" is no wildcard
+    assert names(online, "%") == [] and names(online, "zzz") == []
+    assert names(online, limit=2) == ["inv_online1", "Inv_Online2"]
+    assert names(online, limit=0) == []
+    assert names([]) == ["inv_peer"]                                          # nobody online: DM peers only
+    assert names(iter(online)) == ["inv_online1", "Inv_Online2", "inv_peer"]  # any iterable
+    repo.resolve_request(invite.request_id, "declined", invited.user_id)      # declined: may be invited again
+    repo.join_group(g.chat_id, on1.user_id)                                   # joined: not any more
+    assert names(online) == ["inv_invited", "Inv_Online2", "inv_peer"]
+    # For another member the DM peers are their own; the group's members stay out.
+    assert [u.username for u in repo.find_invitees(g.chat_id, member.user_id, online)] == \
+        ["inv_invited", "Inv_Online2"]
+
+
+def test_get_pending_invite_by_group_and_user(repo):
+    owner, guest = make_user(repo, "gpi_owner"), make_user(repo, "gpi_guest")
+    g = repo.create_group("pending", "", owner.user_id)
+    assert repo.get_pending_invite(g.chat_id, guest.user_id) is None
+    invite = repo.create_request("invite", owner.user_id, guest.user_id, chat_id=g.chat_id)
+    assert repo.get_pending_invite(g.chat_id, guest.user_id) == invite
+    assert repo.get_pending_invite(g.chat_id, owner.user_id) is None          # a member, not invited
+    assert repo.get_pending_invite(uuid.uuid4(), guest.user_id) is None
+    repo.resolve_request(invite.request_id, "accepted", guest.user_id)
+    assert repo.get_pending_invite(g.chat_id, guest.user_id) is None          # accepted: nothing pending
+    dm, _ = repo.create_dm(owner.user_id, guest.user_id)
+    assert repo.get_pending_invite(dm.chat_id, guest.user_id) is None

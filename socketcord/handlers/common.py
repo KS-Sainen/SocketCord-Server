@@ -6,15 +6,30 @@ same order the changes were committed.
 """
 from __future__ import annotations
 
+import re
 from typing import Iterable, Optional
 
 from ..db.base import Chat, ChatRequest, GroupListItem, Member, Message, MessageQuery, UserRef, UUID
 from ..protocol import ReplyCord
-from ..router import RequestContext, forbidden, not_found
+from ..router import RequestContext, bad_request, forbidden, not_found
 from ..views import chat_info_view, chat_item_view, message_view, ref_of, request_view, user_ref
 
 MAX_MESSAGE_LEN = 4000
 MEMBERS_IN_CHAT_INFO = 500      # members (and pending invites, shown to members) in a chat info object
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+
+def username_field(ctx: RequestContext, required: bool = True) -> Optional[str]:
+    """`username`, by the registration rule: 3-32 letters, digits, '_', '.' or '-'
+    (trimmed first). Uniqueness is the caller's check."""
+    name = ctx.str_field("username", required=required, max_len=64)
+    if name is None:
+        return None
+    if not USERNAME_RE.match(name):
+        raise bad_request("INVALID_USERNAME",
+                          "username must be 3-32 characters of letters, digits, '_', '.' or '-'",
+                          field="username")
+    return name
 
 
 def get_chat_or_404(ctx: RequestContext, chat_id: UUID) -> Chat:
@@ -112,6 +127,35 @@ def announce_request(ctx: RequestContext, request: ChatRequest, to: Optional[UUI
     if to is not None:
         ctx.hub.push([to], ReplyCord.event("request", {"request": request_view(request)}),
                      exclude_conn=ctx.peer.conn_id)
+
+
+def answer_request(ctx: RequestContext, req: ChatRequest, status: str) -> Optional[dict]:
+    """The caller accepts / declines / cancels a request it may answer: the change,
+    its pushes, and the reply fields {"request", and when accepted "chat" (+ "info"
+    for an invite)}. None if it was no longer pending by the time it was resolved."""
+    me = ctx.user.user_id
+    with ctx.app.chat_lock(req.chat_id):
+        resolved = ctx.repo.resolve_request(req.request_id, status, me)
+        if resolved is None:
+            return None
+        if status == "accepted":
+            if req.kind == "dm":
+                room = ctx.repo.get_chat(req.chat_id)
+                if room is not None:
+                    announce_dm_open(ctx, room, [req.from_user, me])
+            else:
+                chat = ctx.repo.get_chat(req.chat_id)
+                if chat is not None:
+                    after_join(ctx, chat, ctx.user)
+    result = {"request": request_view(resolved)}
+    if status == "accepted":
+        result["chat"] = chat_item(ctx, me, req.chat_id)
+        if req.kind == "invite":
+            chat = ctx.repo.get_chat(req.chat_id)
+            if chat is not None:
+                result["info"] = chat_info_for(ctx, chat)
+    announce_request(ctx, resolved, req.to_user if status == "cancelled" else req.from_user)
+    return result
 
 
 def check_request_limits(ctx: RequestContext, target_id: UUID) -> None:

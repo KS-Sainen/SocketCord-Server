@@ -31,7 +31,7 @@ from psycopg_pool import ConnectionPool, PoolClosed, PoolTimeout
 from .. import scram
 from .base import (DEFAULT_TEXT_BG_COLOR, DEFAULT_TEXT_COLOR, NO_MESSAGE, AlreadyMember,
                    AlreadyRequested, Chat, ChatListItem, ChatRequest, DatabaseUnavailable,
-                   GroupListItem, JoinResult, Member, Message, MessageQuery, NotFoundError,
+                   GroupListItem, JoinResult, Member, MemberGroup, Message, MessageQuery, NotFoundError,
                    RateLimited, RegistrationLimit, Repository, RepositoryError, SameColors, Session,
                    User, UserRef, UsernameTaken, UUID, message_time, new_message_id)
 
@@ -42,6 +42,8 @@ T = TypeVar("T")
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 SCHEMA_LOCK_ID = 7_350_001
 PAIR_INDEX = "dms_one_per_pair"                      # one DM per pair of users
+USERNAME_INDEX = "users_username_lower_key"          # unique names without regard to case
+USERNAME_CHECK = "users_username_check"              # the username's CHECK (PostgreSQL's own name for it)
 COLOR_RE = re.compile(r"#[0-9a-f]{6}")                # used with fullmatch()
 NIL = "'00000000-0000-0000-0000-000000000000'::uuid"  # NO_MESSAGE: sorts before every message id
 
@@ -394,21 +396,30 @@ class PostgresRepository(Repository):
             ).fetchall()
         return [_user(r) for r in rows[:max(0, limit)]], len(rows) > max(0, limit)
 
-    def update_profile(self, user_id, text_color, text_bg_color):
+    def update_profile(self, user_id, text_color, text_bg_color, username=None):
         def work(conn: psycopg.Connection) -> Optional[User]:
             try:
                 row = conn.execute(
-                    f"""UPDATE users SET text_color = coalesce(%s, text_color),
+                    f"""UPDATE users SET username = coalesce(%s, username),
+                                         text_color = coalesce(%s, text_color),
                                          text_bg_color = coalesce(%s, text_bg_color)
                          WHERE user_id = %s
                      RETURNING {USER_COLS}""",
-                    (text_color, text_bg_color, user_id),
+                    (username, text_color, text_bg_color, user_id),
                 ).fetchone()
-            except pg_errors.CheckViolation:
+            except pg_errors.CheckViolation as exc:
+                if exc.diag.constraint_name == USERNAME_CHECK:
+                    raise ValueError("username must be 3..32 of A-Z a-z 0-9 _ . -") from None
                 # With well-formed colours the only CHECK left is text_color <> text_bg_color.
                 if all(c is None or COLOR_RE.fullmatch(c) for c in (text_color, text_bg_color)):
                     raise SameColors("the text and background colours would be the same") from None
                 raise ValueError("colours must be '#rrggbb' in lowercase") from None
+            except pg_errors.StringDataRightTruncation:
+                raise ValueError("a username is at most 32 and a colour 7 characters") from None
+            except pg_errors.UniqueViolation as exc:
+                if exc.diag.constraint_name != USERNAME_INDEX:
+                    raise
+                raise UsernameTaken(username) from None
             return _user(row) if row else None
 
         return self._write(work)
@@ -591,6 +602,48 @@ class PostgresRepository(Repository):
         for r in members:
             by_chat.setdefault(r["chat_id"], []).append(_member(r))
         return [GroupListItem(chat=_chat(r), members=by_chat.get(r["chat_id"], [])) for r in chats], has_more
+
+    def list_member_groups(self, user_id, viewer_id=None) -> List[MemberGroup]:
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"""SELECT {CHAT_COLS},
+                           CASE WHEN g.created_by = gm.user_id THEN 'owner' ELSE 'member' END AS role,
+                           gm.joined_at,
+                           (SELECT count(*) FROM group_memberships am
+                             WHERE am.group_id = gm.group_id AND am.status = 'accepted') AS member_count,
+                           EXISTS (SELECT 1 FROM group_memberships vm
+                                    WHERE vm.group_id = gm.group_id AND vm.user_id = %(v)s::uuid
+                                      AND vm.status = 'accepted') AS viewer_is_member
+                      FROM group_memberships gm
+                      JOIN chats c ON c.chat_id = gm.group_id
+                      {CHAT_JOINS}
+                     WHERE gm.user_id = %(u)s AND gm.status = 'accepted'
+                     ORDER BY lower(g.group_name) COLLATE "C", c.chat_id""",
+                {"u": user_id, "v": viewer_id},
+            ).fetchall()
+        return [MemberGroup(chat=_chat(r), role=r["role"], joined_at=r["joined_at"],
+                            member_count=r["member_count"], viewer_is_member=r["viewer_is_member"]) for r in rows]
+
+    def find_invitees(self, group_id, inviter_id, online_ids, query="", limit=50) -> List[User]:
+        # strpos is a plain substring search ("_" and "%" are ordinary characters here).
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"""SELECT {USER_COLS} FROM users u
+                     WHERE u.user_id <> %(me)s
+                       AND (u.user_id = ANY(%(online)s::uuid[])
+                            OR EXISTS (SELECT 1 FROM dms d
+                                        WHERE d.status = 'accepted'
+                                          AND ((d.initiator = %(me)s AND d.receiver = u.user_id)
+                                               OR (d.receiver = %(me)s AND d.initiator = u.user_id))))
+                       AND NOT EXISTS (SELECT 1 FROM group_memberships gm
+                                        WHERE gm.group_id = %(g)s AND gm.user_id = u.user_id)
+                       AND strpos(lower(u.username), lower(%(q)s::text)) > 0
+                     ORDER BY lower(u.username) COLLATE "C"
+                     LIMIT %(n)s""",
+                {"me": inviter_id, "online": list(set(online_ids)), "g": group_id, "q": query,
+                 "n": max(0, limit)},
+            ).fetchall()
+        return [_user(r) for r in rows]
 
     def get_members(self, chat_id) -> List[Member]:
         with self._tx() as conn:
@@ -849,6 +902,15 @@ class PostgresRepository(Repository):
                        AND (gm.status = 'pending' OR gm.invited_by IS NOT NULL)
                     LIMIT 1""",
                 {"r": request_id},
+            ).fetchone()
+        return _request(row) if row else None
+
+    def get_pending_invite(self, group_id, user_id) -> Optional[ChatRequest]:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"""{INVITE_REQUEST_SELECT}
+                     WHERE gm.group_id = %s AND gm.user_id = %s AND gm.status = 'pending'""",
+                (group_id, user_id),
             ).fetchone()
         return _request(row) if row else None
 

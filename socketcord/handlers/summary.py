@@ -1,4 +1,4 @@
-"""AI summary of a chat (rubric Part 3): GET chat/{chat_id}/summary.
+"""AI summary of a chat (rubric Part 3): GET chat/{chat_id}/summary (POST works too).
 
 Only members can ask, and only for messages they can read anyway (R7/R11): the
 same membership check as GET chat/{chat_id}/messages.
@@ -10,7 +10,7 @@ from uuid import UUID
 
 from ..ai import AiError, SummaryJob, build_transcript, chat_label, reader_label
 from ..db.base import MessageQuery
-from ..protocol import GET, ReplyCord, Status
+from ..protocol import GET, POST, ReplyCord, Status
 from ..router import ApiError, RequestContext, bad_request, ok
 from . import router
 from .common import get_chat_or_404, limit, require_member
@@ -21,6 +21,7 @@ LANGUAGE_RE = re.compile(r"[A-Za-z][A-Za-z -]{0,31}")   # "auto", "th", "en-US",
 
 
 @router.route(GET, "chat/{chat_id:uuid}/summary")
+@router.route(POST, "chat/{chat_id:uuid}/summary")   # the frontend README's method: the same call
 def chat_summary(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     chat = get_chat_or_404(ctx, chat_id)
     member = require_member(ctx, chat)

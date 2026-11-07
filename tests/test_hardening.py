@@ -301,7 +301,8 @@ def test_presence_events_end_in_the_true_state():
 
 # ---------------------------------------------------------------------- 8. DM consent
 
-def test_dm_is_not_opened_if_their_request_was_just_cancelled(server, monkeypatch):
+def test_dm_is_not_opened_if_their_request_was_just_cancelled(make_server, monkeypatch):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("racea"), server.user("raceb")
     repo = server.app.repo
     a.post(f"users/{b.user_id}/dm", {"message": "hi"})

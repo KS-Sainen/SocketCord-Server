@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from .db.base import NO_MESSAGE, Chat, ChatListItem, ChatRequest, GroupListItem, Member, Message, User, UserRef, UUID
+from .db.base import (NO_MESSAGE, Chat, ChatListItem, ChatRequest, GroupListItem, Member, MemberGroup, Message,
+                      User, UserRef, UUID)
 from .presence import OnlineUser, PresenceHub
 
 PREVIEW_LEN = 120
@@ -119,6 +120,15 @@ def group_view(item: GroupListItem, hub: PresenceHub, viewer: Optional[UUID],
             "members": [member_view(m, hub) for m in shown],
             "members_truncated": len(shown) < len(item.members),
             "joined": viewer is not None and any(m.user_id == viewer for m in item.members)}
+
+
+def member_group_view(g: MemberGroup) -> dict:
+    """An entry of GET users/{user_id}/groups: a group, that user's place in it, and
+    whether the caller is in it too (`joined`)."""
+    chat = g.chat
+    return {"chat_id": chat.chat_id, "kind": chat.kind, "is_dm": False, "name": chat.name,
+            "description": chat.description, "created_at": chat.created_at, "member_count": g.member_count,
+            "role": g.role, "joined_at": g.joined_at, "joined": g.viewer_is_member}
 
 
 def request_view(r: ChatRequest) -> dict:

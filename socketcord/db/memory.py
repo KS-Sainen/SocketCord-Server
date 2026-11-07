@@ -32,9 +32,9 @@ from .. import scram
 from ..security import client_key
 from .base import (DEFAULT_TEXT_BG_COLOR, DEFAULT_TEXT_COLOR, NO_MESSAGE, AlreadyMember,
                    AlreadyRequested, Chat, ChatListItem, ChatRequest, GroupListItem, JoinResult,
-                   Member, Message, MessageQuery, NotFoundError, RateLimited, RegistrationLimit,
-                   Repository, SameColors, Session, User, UserRef, UsernameTaken, UUID,
-                   message_time, new_message_id)
+                   Member, MemberGroup, Message, MessageQuery, NotFoundError, RateLimited,
+                   RegistrationLimit, Repository, SameColors, Session, User, UserRef, UsernameTaken,
+                   UUID, message_time, new_message_id)
 
 # The CHECK constraints of schema.sql, as Python sees them (re.fullmatch = PostgreSQL's ^...$).
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{3,32}")
@@ -468,11 +468,13 @@ class MemoryRepository(Repository):
             return [self._user(row) for row in page], len(found) > offset + limit
 
     def update_profile(self, user_id: UUID, text_color: Optional[str],
-                       text_bg_color: Optional[str]) -> Optional[User]:
+                       text_bg_color: Optional[str], username: Optional[str] = None) -> Optional[User]:
         with self._lock:
             row = self._users.get(user_id)
             if row is None:
                 return None
+            # The order PostgreSQL checks them in: the row's CHECKs (by constraint name, so
+            # the colour pair comes first), then the unique index on lower(username).
             color = row.text_color if text_color is None else _varchar(text_color, 7, "text_color")
             bg = row.text_bg_color if text_bg_color is None else _varchar(text_bg_color, 7, "text_bg_color")
             if color == bg or _COLOR_RE.fullmatch(color) is None or _COLOR_RE.fullmatch(bg) is None:
@@ -481,7 +483,20 @@ class MemoryRepository(Repository):
                 if all(c is None or _COLOR_RE.fullmatch(c) for c in (text_color, text_bg_color)):
                     raise SameColors("the text and background colours would be the same")
                 raise _invalid("colours must be '#rrggbb' in lowercase")
+            name = row.username
+            if username is not None:
+                name = _varchar(username, 32, "username")
+                if _USERNAME_RE.fullmatch(name) is None:
+                    raise _invalid("username must be 3..32 of A-Z a-z 0-9 _ . -")
+                holder = self._by_name.get(name.lower())
+                if holder is not None and holder != user_id:
+                    raise UsernameTaken(name)
             row.text_color, row.text_bg_color = color, bg
+            if name != row.username:
+                if self._by_name.get(row.username.lower()) == user_id:
+                    del self._by_name[row.username.lower()]
+                row.username = name
+                self._by_name[name.lower()] = user_id
             return self._user(row)
 
     # ------------------------------------------------------------------ sessions
@@ -608,6 +623,39 @@ class MemoryRepository(Repository):
             page = groups[offset:offset + limit]
             return ([GroupListItem(chat=self._chat(g.group_id), members=self._group_members(g)) for g in page],
                     len(groups) > offset + limit)
+
+    def list_member_groups(self, user_id: UUID, viewer_id: Optional[UUID] = None) -> List[MemberGroup]:
+        with self._lock:
+            rows = []
+            for group in self._groups.values():
+                m = group.memberships.get(user_id)
+                if m is None or m.status != "accepted":
+                    continue
+                viewer = group.memberships.get(viewer_id) if viewer_id is not None else None
+                rows.append(MemberGroup(
+                    chat=self._chat(group.group_id), role="owner" if group.created_by == user_id else "member",
+                    joined_at=m.joined_at,  # type: ignore[arg-type]
+                    member_count=sum(1 for x in group.memberships.values() if x.status == "accepted"),
+                    viewer_is_member=viewer is not None and viewer.status == "accepted"))
+        # ORDER BY lower(group_name) COLLATE "C", chat_id
+        rows.sort(key=lambda r: (_lower(r.chat.name or ""), r.chat.chat_id))
+        return rows
+
+    def find_invitees(self, group_id: UUID, inviter_id: UUID, online_ids: Iterable[UUID],
+                      query: str = "", limit: int = 50) -> List[User]:
+        limit = max(0, limit)
+        online = set(online_ids)
+        needle = _lower(query)
+        with self._lock:
+            group = self._groups.get(group_id)
+            in_group = set(group.memberships) if group is not None else set()   # accepted or pending
+            peers = {d.receiver if d.initiator == inviter_id else d.initiator for d in self._dms.values()
+                     if d.status == "accepted" and inviter_id is not None and inviter_id in (d.initiator, d.receiver)}
+            found = [row for uid, row in self._users.items()
+                     if uid != inviter_id and uid not in in_group and (uid in online or uid in peers)
+                     and needle in _lower(row.username)]
+            found.sort(key=lambda row: _lower(row.username))
+            return [self._user(row) for row in found[:limit]]
 
     def get_members(self, chat_id: UUID) -> List[Member]:
         with self._lock:
@@ -736,7 +784,7 @@ class MemoryRepository(Repository):
             if query.ascending:
                 page = matched[:count]
             else:   # the newest `count`, returned oldest first
-                page = matched[len(matched) - count:] if count else []
+                page = matched[max(0, len(matched) - count):] if count else []
             return [self._message(row) for row in page], len(matched) > len(page)
 
     def first_message_after(self, chat_id: UUID, after: UUID) -> Optional[UUID]:
@@ -817,6 +865,14 @@ class MemoryRepository(Repository):
             if m is not None and (m.status == "pending" or m.invited_by is not None):
                 return self._invite_request(group, m)
             return None
+
+    def get_pending_invite(self, group_id: UUID, user_id: UUID) -> Optional[ChatRequest]:
+        with self._lock:
+            group = self._groups.get(group_id)
+            m = group.memberships.get(user_id) if group is not None else None
+            if m is None or m.status != "pending":
+                return None
+            return self._invite_request(group, m)  # type: ignore[arg-type]
 
     def _pending(self, user_id: UUID) -> Tuple[List[ChatRequest], List[ChatRequest]]:
         incoming: List[ChatRequest] = []

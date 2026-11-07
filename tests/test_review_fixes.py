@@ -7,7 +7,8 @@ from socketcord.protocol import GET, POST, RequestCord
 from socketcord_client import ApiFailure  # noqa: F401  (imported for parity with the other test files)
 
 
-def test_dm_requester_does_not_see_their_own_first_message_as_unread(server):
+def test_dm_requester_does_not_see_their_own_first_message_as_unread(make_server):
+    server = make_server(dm_require_accept=True)       # the first DM is a request
     a, b = server.user("own_a"), server.user("own_b")
     rid = a.post(f"users/{b.user_id}/dm", {"message": "first, from a"})["request"]["request_id"]
     b.post(f"users/requests/{rid}/accept")
