@@ -47,10 +47,25 @@ METHOD_NAMES = {POST: "POST", GET: "GET", PATCH: "PATCH"}
 class Status:
     OK = 200
     BAD_REQUEST = 250      # malformed packet or payload (missing/invalid fields)
-    UNAUTHORIZED = 251     # bad/expired session, failed challenge-response
+    UNAUTHORIZED = 251     # bad/expired session, wrong username or password
     FORBIDDEN = 252        # understood but refused (not a member, rate limited, name taken)
     NOT_FOUND = 253        # unknown method/URL, unknown resource, or no credentials on a protected call
     INTERNAL_ERROR = 254   # server-side failure (bug, database down)
+
+
+# Every path the server pushes by itself (contract v2 section 4). A push carries
+# neither "method" nor "rid", which is how a client tells one from a reply.
+PUSH_PATHS = frozenset({
+    "chat/new_message",       # someone posted in a chat you are in
+    "chats/new",              # you were invited to a group, or a DM was opened with you
+    "chat/members_changed",   # a member joined, left, renamed, changed colours, or an invite was cancelled
+    "users/status",           # somebody went online or offline
+    "chats/group_created",    # a new group exists (it shows in the all-groups list)
+    "chats/group_deleted",    # its last member left
+    "users/request",          # a DM request or invitation changed state
+    "users/profile_changed",  # somebody changed their username or colours
+    "login/revoked",          # your session ended (signed in elsewhere, logged out, expired)
+})
 
 
 REQUEST_HEADER = struct.Struct("!I16s16sHHII")
@@ -63,9 +78,10 @@ UINT32_MAX = (1 << 32) - 1
 
 
 def _iso(dt: datetime) -> str:
+    """ISO 8601 in UTC with a "+00:00" offset, never a "Z" suffix (contract v2 section 3)."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def json_default(obj: Any) -> Any:
@@ -287,8 +303,10 @@ class ReplyCord:
     """One server reply (or server push). Same helpers as RequestCord.
 
     `data` is the JSON object that becomes the reply message. The router adds
-    "path" (the request URL, or "event/<name>" for pushes) and echoes "rid"
-    if the request carried one, so the client knows what the reply is for.
+    "path" (the semantic name of the call, see contract v2 section 2) and
+    "method", and echoes "rid" if the request carried one, so the client knows
+    what the reply is for. A push has a "path" from PUSH_PATHS and neither
+    "method" nor "rid".
     """
 
     status: int = Status.OK
@@ -304,9 +322,9 @@ class ReplyCord:
         return reply
 
     @classmethod
-    def event(cls, name: str, data: Optional[dict] = None) -> "ReplyCord":
-        """A server push. The client tells it apart by path = "event/<name>"."""
-        return cls.from_dict(Status.OK, data, path=f"event/{name}")
+    def push(cls, path: str, data: Optional[dict] = None) -> "ReplyCord":
+        """A server push: one of PUSH_PATHS, with no "method" and no "rid"."""
+        return cls.from_dict(Status.OK, data, path=path)
 
     def set_dict(self, data: Optional[dict]) -> None:
         if data is None:

@@ -8,10 +8,8 @@ import uuid
 
 import pytest
 
-from socketcord import scram
 from socketcord.presence import OnlineUser, PresenceHub
 from socketcord.protocol import GET, PATCH, POST, ReplyCord, ReplyParser, RequestCord
-from socketcord.security import ChallengeStore
 from socketcord.views import chat_info_view
 from socketcord_client import ApiFailure
 
@@ -96,14 +94,16 @@ def test_quick_reconnect_does_not_flap_presence(server):
     a = server.user("flapper")
     watcher.drain_events()
     uid, token = a.user_id, a.token
-    a.close()
+    # The socket is opened before the old one closes, so the reconnect itself is one
+    # request: on a loaded machine, opening it afterwards can take the whole grace period.
     again = server.client()
     again.user_id, again.token = uid, token
+    a.close()
     again.get("chats")                                         # back within the grace period
     time.sleep(3)
-    assert [e for e in watcher.drain_events() if e.path == "event/presence"] == []
+    assert [e for e in watcher.drain_events() if e.path == "users/status"] == []
     again.close()
-    ev = watcher.wait_event("presence", timeout=6, match=lambda d: not d["online"])
+    ev = watcher.wait_event("users/status", timeout=6, match=lambda d: not d["online"])
     assert ev.data["user"]["username"] == "flapper" and ev.data["seq"] > 0
 
 
@@ -111,7 +111,7 @@ def test_online_list_carries_the_presence_seq(server):
     a = server.user("seqa")
     first = a.get("users/online")["presence_seq"]
     server.user("seqb")
-    ev = a.wait_event("presence", match=lambda d: d["online"])
+    ev = a.wait_event("users/status", match=lambda d: d["online"])
     assert ev.data["seq"] > first and a.get("users/online")["presence_seq"] >= ev.data["seq"]
 
 
@@ -139,7 +139,7 @@ def test_connections_per_account_are_capped(make_server):
     assert (reply.status, reply.data["error"]) == (252, "TOO_MANY_CONNECTIONS")
     third.login("capper", "pw-capper-secret")                  # a fresh login replaces the session:
     for old in (first, second):                                # every old connection goes, for that reason
-        old.wait_event("session_revoked", match=lambda d: d["reason"] == "logged_in_elsewhere")
+        old.wait_event("login/revoked", match=lambda d: d["reason"] == "logged_in_elsewhere")
     assert third.get("chats") is not None
 
 
@@ -147,25 +147,12 @@ def test_shared_address_cannot_lock_out_real_users(server):
     server.client().register("realuser", "real-pw")
     c = server.client()
     for i in range(55):                                        # junk names from the same address
-        flow = scram.LoginFlow(f"nobody{i}", "x", min_iterations=4096)
-        ch = c.request(POST, "users/login", flow.start(), auth=False)
-        if ch.status != 200:
+        reply = c.request(POST, "users/login", {"username": f"nobody{i}", "password": "x"}, auth=False)
+        if reply.data.get("error") == "RATE_LIMITED":
             break
-        c.request(POST, "users/login", flow.respond(ch.data), auth=False)
-    stuck = c.request(POST, "users/login", {"username": "nobody-else", "client_nonce": scram.new_nonce()},
-                      auth=False)
-    assert (stuck.status, stuck.data["error"]) == (252, "TOO_MANY_ATTEMPTS")
+    stuck = c.request(POST, "users/login", {"username": "nobody-else", "password": "x"}, auth=False)
+    assert (stuck.status, stuck.data["error"]) == (252, "RATE_LIMITED")
     server.client().login("realuser", "real-pw")               # the real account still works
-
-
-def test_challenge_store_is_bounded_and_refuses_closed_connections():
-    store = ChallengeStore(60, is_open=lambda conn_id: conn_id != 99)
-    assert store.issue("login", 99) is None
-    for _ in range(10):
-        store.issue("login", 1)
-    assert len(store) == store.MAX_PER_CONNECTION
-    store.drop_connection(1)
-    assert len(store) == 0
 
 
 # ---------------------------------------------------------------------- groups and messages
@@ -175,7 +162,7 @@ def test_group_updates_are_small_deltas(server):
     gid = host.post("chats", {"name": "delta"})["chat"]["chat_id"]
     watcher.drain_events()
     guest.post(f"chat/{gid}/join")
-    ev = watcher.wait_event("group_updated")
+    ev = watcher.wait_event("chat/members_changed")
     assert ev.data["change"] == "joined" and ev.data["member_count"] == 2
     assert ev.data["user"]["username"] == "dguest" and "members" not in ev.data
 
@@ -200,8 +187,8 @@ def test_search_text_is_short_and_literal(server):
     gid = c.post("chats", {"name": "search"})["chat"]["chat_id"]
     for text in ("100% sure", "snake_case", "plain"):
         c.post(f"chat/{gid}/message", {"content": text})
-    assert [m["content"] for m in c.get(f"chat/{gid}/messages", {"content": "_"})["messages"]] == ["snake_case"]
-    assert [m["content"] for m in c.get(f"chat/{gid}/messages", {"content": "%"})["messages"]] == ["100% sure"]
+    assert [m["text"] for m in c.get(f"chat/{gid}/messages", {"content": "_"})["messages"]] == ["snake_case"]
+    assert [m["text"] for m in c.get(f"chat/{gid}/messages", {"content": "%"})["messages"]] == ["100% sure"]
     assert c.request(GET, f"chat/{gid}/messages", {"content": "x" * 51}).status == 250
 
 
@@ -236,7 +223,7 @@ def test_dm_sent_while_the_request_is_being_accepted_lands_in_the_room(make_serv
     monkeypatch.undo()
     assert out["status"] == "sent"
     room = server.app.repo.find_dm(a.user_id, b.user_id)
-    assert [m["content"] for m in a.get(f"chat/{room.chat_id}/messages")["messages"]] == ["hi", "t2"]
+    assert [m["text"] for m in a.get(f"chat/{room.chat_id}/messages")["messages"]] == ["hi", "t2"]
     assert a.get("users/requests")["incoming"] == []
 
 

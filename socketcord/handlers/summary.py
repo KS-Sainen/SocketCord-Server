@@ -20,8 +20,8 @@ MODES = ("recent", "unread")
 LANGUAGE_RE = re.compile(r"[A-Za-z][A-Za-z -]{0,31}")   # "auto", "th", "en-US", "Thai", ...
 
 
-@router.route(GET, "chat/{chat_id:uuid}/summary")
-@router.route(POST, "chat/{chat_id:uuid}/summary")   # the frontend README's method: the same call
+@router.route(GET, "chat/{chat_id:uuid}/summary", path="chat/summary")
+@router.route(POST, "chat/{chat_id:uuid}/summary", path="chat/summary")   # the same call by POST
 def chat_summary(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     chat = get_chat_or_404(ctx, chat_id)
     member = require_member(ctx, chat)

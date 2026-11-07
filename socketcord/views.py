@@ -1,8 +1,10 @@
 """Turns records into the JSON objects sent to clients (one place, so every reply agrees).
 
-Every embedded user has the same shape: {user_id, username, text_color,
-text_bg_color}, plus "online" where presence matters. Read markers are sent as
-null for "nothing read" (NO_MESSAGE inside the server).
+Field names and formats follow wire contract v2 section 3: a user is
+{user_id, username, text_color, background} (plus "online" where presence
+matters), a message is {id, sender_id, sender, text, time}, colours are
+"#RRGGBB" in upper case, and read markers are null for "nothing read"
+(NO_MESSAGE inside the server).
 """
 from __future__ import annotations
 
@@ -13,6 +15,11 @@ from .db.base import (NO_MESSAGE, Chat, ChatListItem, ChatRequest, GroupListItem
 from .presence import OnlineUser, PresenceHub
 
 PREVIEW_LEN = 120
+
+
+def color(value: Optional[str]) -> Optional[str]:
+    """Colours are stored lower case and sent upper case."""
+    return value.upper() if isinstance(value, str) else value
 
 
 def online_user(user: User) -> OnlineUser:
@@ -26,8 +33,8 @@ def marker(message_id: Optional[UUID]) -> Optional[UUID]:
 def user_ref(ref: Optional[UserRef], hub: Optional[PresenceHub] = None) -> Optional[dict]:
     if ref is None:
         return None
-    d = {"user_id": ref.user_id, "username": ref.username, "text_color": ref.text_color,
-         "text_bg_color": ref.text_bg_color}
+    d = {"user_id": ref.user_id, "username": ref.username, "text_color": color(ref.text_color),
+         "background": color(ref.text_bg_color)}
     if hub is not None:
         d["online"] = hub.is_online(ref.user_id)
     return d
@@ -45,25 +52,29 @@ def user_view(user: User, hub: PresenceHub, full: bool = False) -> dict:
 
 
 def member_view(m: Member, hub: PresenceHub) -> dict:
-    return {"user_id": m.user_id, "username": m.username, "text_color": m.text_color,
-            "text_bg_color": m.text_bg_color, "role": m.role, "joined_at": m.joined_at,
+    return {"user_id": m.user_id, "username": m.username, "text_color": color(m.text_color),
+            "background": color(m.text_bg_color), "role": m.role, "joined_at": m.joined_at,
             "online": hub.is_online(m.user_id)}
 
 
 def message_view(m: Message, preview: bool = False) -> dict:
-    content = m.content
-    if preview and len(content) > PREVIEW_LEN:
-        content = content[:PREVIEW_LEN - 1] + "…"
-    return {"message_id": m.message_id, "chat_id": m.chat_id, "kind": m.kind, "content": content,
-            "created_at": m.created_at, "sender": user_ref(m.sender)}
+    """{id, sender_id, sender, text, time}: `sender` is the username, null on a
+    system line, and `chat_id`/`kind` come along for clients that need them."""
+    text = m.content
+    if preview and len(text) > PREVIEW_LEN:
+        text = text[:PREVIEW_LEN - 1] + "…"
+    return {"id": m.message_id, "chat_id": m.chat_id, "kind": m.kind, "text": text,
+            "time": m.created_at, "sender_id": m.sender_id,
+            "sender": m.sender.username if m.sender else None}
 
 
 def chat_item_view(item: ChatListItem, hub: PresenceHub) -> dict:
     """A chat as it appears in GET chats (and wherever a chat joins the caller's list)."""
     chat = item.chat
     d = {"chat_id": chat.chat_id, "kind": chat.kind, "is_dm": chat.kind == "dm", "name": chat.name,
-         "description": chat.description, "role": item.role, "member_count": item.member_count,
-         "unread": item.unread, "last_read_message_id": marker(item.last_read_message_id),
+         "pending": False, "description": chat.description, "role": item.role,
+         "member_count": item.member_count, "unread": item.unread,
+         "last_read_message_id": marker(item.last_read_message_id),
          "last_message": message_view(item.last_message, preview=True) if item.last_message else None,
          "last_activity": item.last_message.created_at if item.last_message else chat.created_at}
     if chat.kind == "dm":
@@ -72,14 +83,23 @@ def chat_item_view(item: ChatListItem, hub: PresenceHub) -> dict:
     return d
 
 
+def invited_chat_view(chat: Chat, invited_at, member_count: int) -> dict:
+    """A group the caller has been invited to but has not accepted: the same row as
+    chat_item_view with pending = true, so the GUI can list it greyed out."""
+    return {"chat_id": chat.chat_id, "kind": chat.kind, "is_dm": False, "name": chat.name,
+            "pending": True, "description": chat.description, "role": "member",
+            "member_count": member_count, "unread": 0, "last_read_message_id": None,
+            "last_message": None, "last_activity": invited_at}
+
+
 def _created_by(chat: Chat, members: List[Member]) -> Optional[dict]:
-    """{user_id, username, text_color, text_bg_color}; username (and colours) are null
+    """{user_id, username, text_color, background}; username (and colours) are null
     once the creator has left the group."""
     if chat.created_by is None:
         return None
     creator = next((m for m in members if m.user_id == chat.created_by), None)
     if creator is None:
-        return {"user_id": chat.created_by, "username": None, "text_color": None, "text_bg_color": None}
+        return {"user_id": chat.created_by, "username": None, "text_color": None, "background": None}
     return user_ref(UserRef(creator.user_id, creator.username, creator.text_color, creator.text_bg_color))
 
 

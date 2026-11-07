@@ -9,7 +9,6 @@ import uuid
 
 import pytest
 
-from socketcord import scram
 from socketcord.protocol import GET, PATCH, POST, ReplyCord, RequestCord
 from socketcord_client import ApiFailure
 
@@ -22,15 +21,19 @@ def err(exc_info) -> tuple:
 
 def test_register_login_info(server):
     c = server.client()
-    done = c.register("alice", "correct horse")
-    assert done["step"] == "done" and done["user"]["username"] == "alice"
+    created = c.register("alice", "correct horse")
+    assert created["path"] == "login/created" and created["username"] == "alice"
     login = c.login("alice", "correct horse")
-    assert login["path"] == "users/login" and uuid.UUID(login["session_token"])
+    assert login["path"] == "login/success" and uuid.UUID(login["session_token"])
+    assert (login["username"], login["text_color"], login["background"]) == ("alice", "#171717", "#F2F2F2")
     info = c.get("users/info")
+    assert info["path"] == "profile/info"
     assert info["user"]["user_id"] == login["user_id"] and info["user"]["online"] is True
 
 
-def test_password_never_crosses_the_socket(server):
+def test_the_password_crosses_the_socket_in_clear_text(server):
+    """Contract v2: the password is in the request body and the socket is not
+    encrypted. What the server keeps is a salted PBKDF2 hash, not the password."""
     c = server.client()
     sent = bytearray()
     original = c.send_raw
@@ -42,16 +45,25 @@ def test_password_never_crosses_the_socket(server):
     c.send_raw = spy
     c.register("carol", "TopSecret-รหัสผ่าน")
     c.login("carol", "TopSecret-รหัสผ่าน")
-    assert "TopSecret".encode() not in sent and "รหัสผ่าน".encode() not in sent
+    assert sent.count("TopSecret".encode()) == 2         # once per call, readable on the wire
+    stored = server.app.repo.get_user_by_username("carol").password_hash
+    assert stored.startswith("SCRAM-SHA-256$") and "TopSecret" not in stored
 
 
-def test_plaintext_password_is_refused(server):
-    """What the current frontend main.py sends: refused with a clear error, nothing stored."""
-    c = server.client()
-    for url in ("users", "users/login"):
-        reply = c.request(POST, url, {"username": "zed", "password": "hunter2"}, auth=False)
-        assert (reply.status, reply.data["error"]) == (250, "PLAINTEXT_PASSWORD")
-    assert server.app.repo.get_user_by_username("zed") is None
+def test_no_reply_or_push_ever_contains_a_password(server):
+    seen = []
+    c = server.client(on_event=seen.append)
+    for data in (c.register("zed", "hunter2"), c.login("zed", "hunter2"),
+                 c.change_password("hunter3"), c.get("users/info"),
+                 c.patch("users/profile", {"text_color": "#00FF00"})):
+        seen.append(data)
+    watcher = server.user("watcher")
+    seen.append(watcher.get("users/online"))
+    for data in seen:
+        data = data.data if hasattr(data, "data") else data
+        text = str(data)
+        assert not any(k in data for k in ("password", "new_password", "old_password")), data
+        assert "hunter2" not in text and "hunter3" not in text
 
 
 def test_unique_names_case_insensitive(server):  # R3
@@ -78,26 +90,6 @@ def test_wrong_password_and_unknown_user_look_the_same(server):
     assert err(e1) == err(e2) == (251, "INVALID_CREDENTIALS")
 
 
-def test_challenge_must_be_answered_on_same_connection(server):
-    server.client().register("frank", "pw-frank")
-    a, b = server.client(), server.client()
-    flow = scram.LoginFlow("frank", "pw-frank", min_iterations=4096)
-    ch = a.call(POST, "users/login", flow.start(), auth=False)
-    reply = b.request(POST, "users/login", flow.respond(ch), auth=False)
-    assert (reply.status, reply.data["error"]) == (251, "CHALLENGE_INVALID")
-
-
-def test_challenge_is_single_use(server):
-    server.client().register("gina", "pw-gina")
-    c = server.client()
-    flow = scram.LoginFlow("gina", "pw-gina", min_iterations=4096)
-    ch = c.call(POST, "users/login", flow.start(), auth=False)
-    answer = flow.respond(ch)
-    assert c.request(POST, "users/login", answer, auth=False).ok
-    replay = c.request(POST, "users/login", answer, auth=False)
-    assert (replay.status, replay.data["error"]) == (251, "CHALLENGE_INVALID")
-
-
 def test_login_throttle(server):
     server.client().register("hank", "pw-hank")
     c = server.client()
@@ -106,34 +98,36 @@ def test_login_throttle(server):
             c.login("hank", "nope")
     with pytest.raises(ApiFailure) as e:
         c.login("hank", "pw-hank")
-    assert err(e) == (252, "TOO_MANY_ATTEMPTS") and e.value.data["retry_after"] > 0
+    assert err(e) == (252, "RATE_LIMITED") and e.value.data["retry_after"] > 0
 
 
-def test_change_password_rotates_the_session_token(server):
+def test_change_password_keeps_the_session_and_the_new_password_works(server):
     server.client().register("ivy", "old-pw")
     a, b = server.client(), server.client()
     a.login("ivy", "old-pw")
     b.user_id, b.token = a.user_id, a.token          # a second connection on the same session
-    assert b.get("users/info")["user"]["username"] == "ivy"
     old_token = a.token
-    done = a.change_password("old-pw", "new-pw")
-    assert done["logged_out_connections"] == 1 and uuid.UUID(done["session_token"]) != old_token
-    ev = b.wait_event("session_revoked")
-    assert ev.data["reason"] == "password_changed"
-    stale = b.request(GET, "users/info")
-    assert (stale.status, stale.data["error"]) == (251, "INVALID_SESSION")
-    assert a.token != old_token and a.get("users/info")["user"]["username"] == "ivy"   # the new token works
-    with pytest.raises(ApiFailure):
-        server.client().login("ivy", "old-pw")
-    server.client().login("ivy", "new-pw")
-
-
-def test_change_password_needs_current_password(server):
-    c = server.user("jack", "real-pw")
+    done = a.change_password("new-pw")
+    assert done["path"] == "profile/password" and done["changed"] is True
+    assert a.token == old_token                      # the token is NOT rotated
+    assert a.get("users/info")["user"]["username"] == "ivy"
+    assert b.get("users/info")["user"]["username"] == "ivy"      # and other connections keep working
     with pytest.raises(ApiFailure) as e:
-        c.change_password("guess", "new")
-    assert err(e) == (252, "INVALID_CREDENTIALS")      # 252, not 251: the session stays valid
-    assert c.get("users/info")["user"]["username"] == "jack"
+        server.client().login("ivy", "old-pw")
+    assert err(e) == (251, "INVALID_CREDENTIALS")
+    assert server.client().login("ivy", "new-pw")["username"] == "ivy"
+
+
+def test_change_password_by_the_older_url_and_its_errors(server):
+    c = server.user("jack", "real-pw")
+    reply = c.request(PATCH, "users/password", {})
+    assert (reply.status, reply.data["error"], reply.data["path"]) == (250, "MISSING_FIELD", "users/password")
+    assert c.request(PATCH, "users/password", {"new_password": ""}).status == 250
+    anon = server.client()
+    assert anon.request(PATCH, "users/password", {"new_password": "x"}, auth=False).status == 253
+    # The older URL is an alias of the same simple flow.
+    assert c.patch("users/profile/password", {"new_password": "second-pw"})["path"] == "profile/password"
+    assert server.client().login("jack", "second-pw")["username"] == "jack"
 
 
 def test_logout(server):
@@ -142,7 +136,7 @@ def test_logout(server):
     c.post("users/logout")                 # keep the old token on purpose
     reply = c.request(GET, "users/info")
     assert (reply.status, reply.data["error"]) == (251, "INVALID_SESSION")   # revoked server-side
-    observer.wait_event("presence", match=lambda d: d["user"]["username"] == "kate" and not d["online"])
+    observer.wait_event("users/status", match=lambda d: d["user"]["username"] == "kate" and not d["online"])
     c.logout = None
     c.user_id = c.token = uuid.UUID(int=0)
     assert c.request(GET, "users/info").status == 253                        # no credentials at all
@@ -201,11 +195,11 @@ def test_online_list_includes_self_and_updates(server):
     users = a.get("users/online")["users"]
     assert [(u["username"], u["is_self"]) for u in users] == [("amy", True)]
     b = server.user("ben")
-    ev = a.wait_event("presence", match=lambda d: d["user"]["username"] == "ben")
+    ev = a.wait_event("users/status", match=lambda d: d["user"]["username"] == "ben")
     assert ev.data["online"] is True
     assert {u["username"] for u in a.get("users/online")["users"]} == {"amy", "ben"}
     b.close()
-    ev = a.wait_event("presence", match=lambda d: d["user"]["username"] == "ben" and not d["online"])
+    ev = a.wait_event("users/status", match=lambda d: d["user"]["username"] == "ben" and not d["online"])
     assert [u["username"] for u in a.get("users/online")["users"]] == ["amy"]
 
 
@@ -241,7 +235,7 @@ def test_reconnect_with_saved_session_is_online_again(server):
     observer = server.user("obs")
     uid, token = a.user_id, a.token
     a.close()
-    observer.wait_event("presence", match=lambda d: d["user"]["username"] == "cat" and not d["online"])
+    observer.wait_event("users/status", match=lambda d: d["user"]["username"] == "cat" and not d["online"])
     again = server.client()
     again.user_id, again.token = uid, token
     again.get("chats")
@@ -256,7 +250,7 @@ def test_group_lifecycle(server):
     gid = created["chat"]["chat_id"]
     assert created["chat"]["role"] == "owner" and created["chat"]["is_dm"] is False   # the GET chats shape
     assert [m["username"] for m in created["group"]["members"]] == ["ann"]   # R8
-    b.wait_event("group_created")
+    b.wait_event("chats/group_created")
 
     groups = b.get("chats/groups")["groups"]                                  # R9
     g = next(x for x in groups if x["chat_id"] == gid)
@@ -270,16 +264,16 @@ def test_group_lifecycle(server):
     joined = b.post(f"chat/{gid}/join")                                       # R10: joins by itself
     assert joined["chat"]["chat_id"] == gid and joined["chat"]["is_dm"] is False   # the GET chats shape
     assert {m["username"] for m in joined["info"]["members"]} == {"ann", "bob"}
-    a.wait_event("message", match=lambda d: d["message"]["kind"] == "system")
+    a.wait_event("chat/new_message", match=lambda d: d["message"]["kind"] == "system")
 
     a.post(f"chat/{gid}/message", {"content": "hello group"})
-    ev = b.wait_event("message", match=lambda d: d["message"]["kind"] == "text")   # R6: new incoming
-    assert ev.data["message"]["content"] == "hello group" and ev.data["chat_id"] == gid
+    ev = b.wait_event("chat/new_message", match=lambda d: d["message"]["kind"] == "text")   # R6
+    assert ev.data["message"]["text"] == "hello group" and ev.data["chat_id"] == gid
     with pytest.raises(TimeoutError):
-        c.wait_event("message", timeout=0.3)                                  # cid is not a member
+        c.wait_event("chat/new_message", timeout=0.3)                                  # cid is not a member
 
     history = b.get(f"chat/{gid}/messages")["messages"]
-    assert [m["content"] for m in history if m["kind"] == "text"] == ["hello group"]
+    assert [m["text"] for m in history if m["kind"] == "text"] == ["hello group"]
 
     assert b.post(f"chat/{gid}/leave")["chat_deleted"] is False
     assert a.post(f"chat/{gid}/leave")["chat_deleted"] is True                # last one out
@@ -290,7 +284,7 @@ def test_invite_needs_accept(server):  # R10
     a, b = server.user("amir"), server.user("bea")
     gid = a.post("chats", {"name": "Invite Only"})["chat"]["chat_id"]
     req = a.post(f"chat/{gid}/invite", {"user_id": str(b.user_id)})["request"]
-    ev = b.wait_event("request")
+    ev = b.wait_event("users/request")
     assert ev.data["request"]["request_id"] == req["request_id"]
     members = {m["username"] for m in a.get(f"chat/{gid}/info")["chat"]["members"]}
     assert members == {"amir"}                                                # not added yet
@@ -299,7 +293,7 @@ def test_invite_needs_accept(server):  # R10
     b.post(f"users/requests/{req['request_id']}/accept")
     members = {m["username"] for m in a.get(f"chat/{gid}/info")["chat"]["members"]}
     assert members == {"amir", "bea"}
-    a.wait_event("request", match=lambda d: d["request"]["status"] == "accepted")
+    a.wait_event("users/request", match=lambda d: d["request"]["status"] == "accepted")
 
 
 def test_decline_invite(server):
@@ -319,25 +313,25 @@ def test_dm_request_accept_and_privacy(make_server):
     a, b, c = server.user("dana"), server.user("eli"), server.user("fay")
     pending = a.post(f"users/{b.user_id}/dm", {"message": "hi eli"})
     assert pending["status"] == "pending"
-    ev = b.wait_event("request")
+    ev = b.wait_event("users/request")
     rid = ev.data["request"]["request_id"]
     assert ev.data["request"]["message"] == "hi eli"
     accepted = b.post(f"users/requests/{rid}/accept")
     dm_id = accepted["chat"]["chat_id"]
     assert accepted["chat"]["kind"] == "dm" and accepted["chat"]["peer"]["username"] == "dana"
-    a.wait_event("chat", match=lambda d: d["reason"] == "dm_opened")
+    a.wait_event("chats/new", match=lambda d: d["reason"] == "dm_opened")
 
     sent = a.post(f"users/{b.user_id}/dm", {"message": "second"})              # room exists now
     assert sent["status"] == "sent" and sent["chat_id"] == dm_id
     b.post(f"chat/{dm_id}/message", {"content": "reply from eli"})
-    a.wait_event("message", match=lambda d: d["message"]["content"] == "reply from eli")
+    a.wait_event("chat/new_message", match=lambda d: d["message"]["text"] == "reply from eli")
 
-    texts = [m["content"] for m in a.get(f"chat/{dm_id}/messages")["messages"]]
+    texts = [m["text"] for m in a.get(f"chat/{dm_id}/messages")["messages"]]
     assert texts == ["hi eli", "second", "reply from eli"]
     for call in (c.request(GET, f"chat/{dm_id}/messages"), c.request(GET, f"chat/{dm_id}/info")):
         assert call.status == 253                                             # fay cannot see it
     with pytest.raises(TimeoutError):
-        c.wait_event("message", timeout=0.3)
+        c.wait_event("chat/new_message", timeout=0.3)
 
 
 def test_dm_crossing_requests_open_the_room(make_server):
@@ -346,7 +340,7 @@ def test_dm_crossing_requests_open_the_room(make_server):
     a.post(f"users/{b.user_id}/dm", {"message": "from gus"})
     crossed = b.post(f"users/{a.user_id}/dm", {"message": "from hal"})
     assert crossed["status"] == "sent"
-    texts = [m["content"] for m in b.get(f"chat/{crossed['chat_id']}/messages")["messages"]]
+    texts = [m["text"] for m in b.get(f"chat/{crossed['chat_id']}/messages")["messages"]]
     assert texts == ["from gus", "from hal"]
 
 
@@ -355,8 +349,8 @@ def test_dm_without_accept_when_configured(make_server):
     a, b = srv.user("ira"), srv.user("jon")
     out = a.post(f"users/{b.user_id}/dm", {"message": "straight in"})
     assert out["status"] == "sent"
-    ev = b.wait_event("message")
-    assert ev.data["message"]["content"] == "straight in"
+    ev = b.wait_event("chat/new_message")
+    assert ev.data["message"]["text"] == "straight in"
 
 
 def test_dm_to_self_or_unknown(server):
@@ -374,7 +368,7 @@ def test_chat_list_unread_and_mark_read(server):
     for i in range(3):
         a.post(f"chat/{gid}/message", {"content": f"m{i}"})
     chat = next(x for x in b.get("chats")["chats"] if x["chat_id"] == gid)
-    assert chat["unread"] == 3 and chat["last_message"]["content"] == "m2"
+    assert chat["unread"] == 3 and chat["last_message"]["text"] == "m2"
     b.post(f"chat/{gid}/read")
     chat = next(x for x in b.get("chats")["chats"] if x["chat_id"] == gid)
     assert chat["unread"] == 0
@@ -388,16 +382,16 @@ def test_chat_list_unread_and_mark_read(server):
 def test_message_filters(server):
     a = server.user("ned")
     gid = a.post("chats", {"name": "Filters"})["chat"]["chat_id"]
-    ids = [a.post(f"chat/{gid}/message", {"content": t})["message"]["message_id"]
+    ids = [a.post(f"chat/{gid}/message", {"content": t})["message"]["id"]
            for t in ("apple pie", "banana", "apple tart", "cherry")]
     page = a.get(f"chat/{gid}/messages", {"count": 2})
-    assert [m["content"] for m in page["messages"]] == ["apple tart", "cherry"] and page["has_more"]
+    assert [m["text"] for m in page["messages"]] == ["apple tart", "cherry"] and page["has_more"]
     older = a.get(f"chat/{gid}/messages", {"count": 2, "before_id": ids[2]})
-    assert [m["content"] for m in older["messages"]] == ["apple pie", "banana"]
+    assert [m["text"] for m in older["messages"]] == ["apple pie", "banana"]
     newer = a.get(f"chat/{gid}/messages", {"after_id": ids[1]})
-    assert [m["content"] for m in newer["messages"]] == ["apple tart", "cherry"]
+    assert [m["text"] for m in newer["messages"]] == ["apple tart", "cherry"]
     found = a.get(f"chat/{gid}/messages", {"content": "APPLE"})
-    assert [m["content"] for m in found["messages"]] == ["apple pie", "apple tart"]
+    assert [m["text"] for m in found["messages"]] == ["apple pie", "apple tart"]
     future = a.get(f"chat/{gid}/messages", {"time": {"after": "2999-01-01T00:00:00Z"}})
     assert future["messages"] == []
     past = a.get(f"chat/{gid}/messages", {"time": "2000-01-01T00:00:00Z"})
@@ -410,14 +404,16 @@ def test_message_filters(server):
 
 def test_profile_colours(server):
     a, b = server.user("ola"), server.user("pip")
-    assert a.get("users/info")["user"]["text_color"] == "#171717"          # the frontend's defaults
-    assert a.get("users/info")["user"]["text_bg_color"] == "#f2f2f2"
-    a.patch("users/profile", {"text_color": "#FFFFFF", "text_bg_color": "#0088ff"})
-    ev = b.wait_event("profile")
-    assert (ev.data["user"]["text_color"], ev.data["user"]["text_bg_color"]) == ("#ffffff", "#0088ff")
+    me = a.get("users/info")["user"]
+    assert (me["text_color"], me["background"]) == ("#171717", "#F2F2F2")   # the frontend's defaults
+    updated = a.patch("users/profile", {"text_color": "#ffffff", "background": "#0088ff"})
+    assert updated["path"] == "profile/updated"
+    assert (updated["user"]["text_color"], updated["user"]["background"]) == ("#FFFFFF", "#0088FF")
+    ev = b.wait_event("users/profile_changed")           # sent on any case, replies are upper case
+    assert (ev.data["user"]["text_color"], ev.data["user"]["background"]) == ("#FFFFFF", "#0088FF")
     online = {u["username"]: u for u in b.get("users/online")["users"]}
-    assert online["ola"]["text_color"] == "#ffffff"
-    for body, field in [({"text_color": "red"}, "text_color"), ({"text_color": "#0088FF"}, "text_color"),
+    assert online["ola"]["text_color"] == "#FFFFFF" and online["ola"]["background"] == "#0088FF"
+    for body, field in [({"text_color": "red"}, "text_color"), ({"text_color": "#0088ff"}, "text_color"),
                         ({}, "text_color")]:
         reply = a.request(PATCH, "users/profile", body)
         assert reply.status == 250 and reply.data["field"] == field, body       # bad, same as background, missing
@@ -428,7 +424,14 @@ def test_profile_colours(server):
 def test_reply_context_path_and_rid(server):
     c = server.user("quinn")
     r = c.request(GET, "/chats/")
-    assert r.data["path"] == "chats" and isinstance(r.data["rid"], int)
+    assert r.data["path"] == "chats/list" and r.data["method"] == "GET" and isinstance(r.data["rid"], int)
+    # A route the contract does not name keeps its URL as the path.
+    assert c.get("users/search", {"query": "qu"})["path"] == "users/search"
+    # Pushes carry a path from PUSH_PATHS and neither "method" nor "rid".
+    other = server.user("quentin")
+    ev = c.wait_event("users/status", match=lambda d: d["user"]["username"] == "quentin")
+    assert "method" not in ev.data and "rid" not in ev.data and ev.data["user_id"] == str(other.user_id)
+    assert ev.data["online"] is True
 
 
 def test_error_statuses(server):
@@ -521,5 +524,5 @@ def test_many_clients_at_once(server):
         c.drain_events()
     owner.post(f"chat/{gid}/message", {"content": "broadcast"})
     for c in clients:
-        c.wait_event("message", match=lambda d: d["message"]["content"] == "broadcast")
+        c.wait_event("chat/new_message", match=lambda d: d["message"]["text"] == "broadcast")
     assert owner.get("users/online")["count"] == 16

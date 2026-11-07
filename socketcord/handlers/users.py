@@ -11,13 +11,13 @@ from ..router import RequestContext, bad_request, forbidden, not_found, ok
 from ..views import member_group_view, message_view, online_user, request_view, user_view
 from . import router
 from .common import (MAX_MESSAGE_LEN, announce_dm_open, announce_pending, announce_request, answer_request,
-                     chat_item, check_request_limits, limit, post_message, username_field)
+                     chat_item, check_request_limits, limit, post_message, spelled, username_field)
 
 COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 SEARCH_COUNT_MAX = 50
 
 
-@router.route(GET, "users/info")
+@router.route(GET, "users/info", path="profile/info")
 def user_info(ctx: RequestContext) -> ReplyCord:
     return ok({"user": user_view(ctx.user, ctx.hub, full=True)})
 
@@ -31,10 +31,11 @@ def _color_field(ctx: RequestContext, key: str) -> Optional[str]:
     return value.lower()
 
 
-@router.route(PATCH, "users/profile")
+@router.route(PATCH, "users/profile", path="profile/updated")
 def update_profile(ctx: RequestContext) -> ReplyCord:
-    """The profile: the username, and its colours (text_color on text_bg_color).
-    `background` is accepted as another name for text_bg_color (the GUI's word)."""
+    """The profile: the username, and its colours (text_color on background).
+    `text_bg_color` is accepted as another name for `background` (the older word);
+    both take "#rrggbb" in either case."""
     username = username_field(ctx, required=False)
     text_color = _color_field(ctx, "text_color")
     text_bg_color = _color_field(ctx, "text_bg_color")
@@ -70,20 +71,27 @@ def update_profile(ctx: RequestContext) -> ReplyCord:
             raise taken from None
         if user is None:
             raise not_found("USER_NOT_FOUND", "account no longer exists")
-        # The online list (GET users/online, event/presence) shows the new name and colours.
+        # The online list (GET users/online, users/status) shows the new name and colours.
         ctx.hub.update_profile(online_user(user))
-        ctx.hub.push_all(ReplyCord.event("profile", {"user": user_view(user, ctx.hub)}),
+        ctx.hub.push_all(ReplyCord.push("users/profile_changed", {"user": user_view(user, ctx.hub)}),
+                         exclude_conn=ctx.peer.conn_id)
+        # Member lists carry the name and colours too, so every chat of this user
+        # changed (contract v2 section 4: "renamed or changed colours").
+        for item in ctx.repo.list_user_chats(ctx.user.user_id):
+            ctx.hub.push([m.user_id for m in ctx.repo.get_members(item.chat.chat_id)],
+                         ReplyCord.push("chat/members_changed", {"chat_id": item.chat.chat_id,
+                                                                 "change": "profile"}),
                          exclude_conn=ctx.peer.conn_id)
     return ok({"user": user_view(user, ctx.hub, full=True)})
 
 
-@router.route(GET, "users/online")
+@router.route(GET, "users/online", path="users/online")
 def online_users(ctx: RequestContext) -> ReplyCord:
     """R4: every client currently connected (logged in), including the caller."""
     me = ctx.user.user_id
     online, seq = ctx.hub.online_snapshot()
     users = [{**u.as_dict(True), "is_self": u.user_id == me} for u in online]
-    # presence_seq: event/presence with a seq not above this is older than this list.
+    # presence_seq: a users/status push with a seq not above this is older than this list.
     return ok({"count": len(users), "users": users, "presence_seq": seq})
 
 
@@ -100,7 +108,7 @@ def search_users(ctx: RequestContext) -> ReplyCord:
                "users": [{**user_view(u, ctx.hub), "is_self": u.user_id == me} for u in users]})
 
 
-@router.route(GET, "users/{user_id:uuid}/groups")
+@router.route(GET, "users/{user_id:uuid}/groups", path="users/groups")
 def user_groups(ctx: RequestContext, user_id: UUID) -> ReplyCord:
     """Every group a user is an accepted member of, by name. Groups and their members
     are public here (GET chats/groups lists them all to everyone, R9), so anyone
@@ -113,8 +121,6 @@ def user_groups(ctx: RequestContext, user_id: UUID) -> ReplyCord:
                "groups": [member_group_view(g) for g in groups]})
 
 
-# ---------------------------------------------------------------------- DMs
-
 def _dm_reply(status: str, chat_id: Optional[UUID], chat: Optional[dict], messages: List,
               request: Optional[ChatRequest]) -> ReplyCord:
     """POST users/{id}/dm always answers with the same keys."""
@@ -123,13 +129,13 @@ def _dm_reply(status: str, chat_id: Optional[UUID], chat: Optional[dict], messag
                "request": request_view(request) if request is not None else None})
 
 
-@router.route(POST, "users/{user_id:uuid}/dm")
+@router.route(POST, "users/{user_id:uuid}/dm", path="chats/dm")
 def send_dm(ctx: RequestContext, user_id: UUID) -> ReplyCord:
     """R7: direct message. By default (DM_REQUIRE_ACCEPT=false) the first one opens
     the room at once; with DM_REQUIRE_ACCEPT=true it is a DM request, and the room
     opens when the other side accepts it."""
     me = ctx.user
-    text = ctx.str_field("message", max_len=MAX_MESSAGE_LEN, multiline=True)
+    text = ctx.str_field(spelled(ctx, "message", "text", "content"), max_len=MAX_MESSAGE_LEN, multiline=True)
     if user_id == me.user_id:
         raise bad_request("INVALID_TARGET", "you cannot DM yourself")
     target = ctx.repo.get_user(user_id)
@@ -197,8 +203,6 @@ def _open_request(ctx: RequestContext, dm: Chat, target, text: str, receiver: UU
     messages, _ = ctx.repo.list_messages(dm.chat_id, MessageQuery(count=20))
     return _dm_reply("sent", dm.chat_id, chat_item(ctx, me, dm.chat_id), messages, resolved)
 
-
-# ---------------------------------------------------------------------- requests and invites
 
 @router.route(GET, "users/requests")
 def list_requests(ctx: RequestContext) -> ReplyCord:

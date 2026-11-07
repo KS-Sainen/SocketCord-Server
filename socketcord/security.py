@@ -1,18 +1,13 @@
-"""Short-lived security state kept in memory: challenges, throttles, the server's DH key."""
+"""Short-lived security state kept in memory: rate limits, login throttles, session hashing."""
 from __future__ import annotations
 
 import hashlib
-import hmac
 import ipaddress
 import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from dataclasses import dataclass, field
-from typing import Callable, Deque, Dict, Optional, Tuple
-
-from . import scram
-from .db.base import UUID
+from typing import Deque, Tuple
 
 
 def client_key(ip: str) -> str:
@@ -24,128 +19,6 @@ def client_key(ip: str) -> str:
     if addr.version == 6:
         return str(ipaddress.ip_network(f"{addr}/64", strict=False))
     return str(addr)
-
-
-@dataclass
-class Challenge:
-    """State the server keeps between step 1 and step 2 of a challenge-response flow."""
-
-    challenge_id: str
-    kind: str                       # "login" | "register" | "password"
-    conn_id: int                    # the answer must come back on the same TCP connection
-    expires_at: float
-    server_nonce: str = field(default_factory=scram.new_nonce)
-    client_nonce: str = ""
-    username: str = ""
-    user_id: Optional[UUID] = None
-    salt: bytes = b""
-    iterations: int = 0
-    new_salt: bytes = b""
-    new_iterations: int = 0
-    device_id: Optional[str] = None
-    session_hash: Optional[bytes] = None
-    dh_private: int = 0             # the server's DH key (register / password change)
-    dh_public: str = ""             # base64 of g^dh_private mod p, as sent to the client
-
-
-class ChallengeStore:
-    """Challenges waiting for step 2, indexed by connection.
-
-    Bounded: at most MAX_PER_CONNECTION per connection and MAX_TOTAL overall
-    (the oldest go first). A challenge is never issued for a connection that
-    already closed, so a client that sends step 1 and hangs up leaves nothing
-    behind. Every operation is O(1) or O(expired).
-    """
-
-    MAX_PER_CONNECTION = 4
-    MAX_TOTAL = 20_000
-
-    def __init__(self, ttl_seconds: int, is_open: Optional[Callable[[int], bool]] = None) -> None:
-        self.ttl = ttl_seconds
-        self._is_open = is_open or (lambda conn_id: True)
-        self._lock = threading.Lock()
-        self._items: "OrderedDict[str, Challenge]" = OrderedDict()   # issue order = expiry order
-        self._by_conn: Dict[int, "OrderedDict[str, None]"] = {}
-
-    def issue(self, kind: str, conn_id: int, **fields) -> Optional[Challenge]:
-        """Returns None if the connection is already closed."""
-        ch = Challenge(challenge_id=str(uuid.uuid4()), kind=kind, conn_id=conn_id,
-                       expires_at=time.monotonic() + self.ttl, **fields)
-        with self._lock:
-            if not self._is_open(conn_id):
-                return None
-            mine = self._by_conn.setdefault(conn_id, OrderedDict())
-            while len(mine) >= self.MAX_PER_CONNECTION:
-                self._remove_locked(next(iter(mine)))
-            while len(self._items) >= self.MAX_TOTAL:
-                self._remove_locked(next(iter(self._items)))
-            self._items[ch.challenge_id] = ch
-            mine[ch.challenge_id] = None
-        return ch
-
-    def _remove_locked(self, challenge_id: str) -> Optional[Challenge]:
-        ch = self._items.pop(challenge_id, None)
-        if ch is not None:
-            mine = self._by_conn.get(ch.conn_id)
-            if mine is not None:
-                mine.pop(challenge_id, None)
-                if not mine:
-                    del self._by_conn[ch.conn_id]
-        return ch
-
-    def take(self, challenge_id: str, kind: str, conn_id: int) -> Optional[Challenge]:
-        """Single use: the challenge is gone after this call, whether or not it matched."""
-        with self._lock:
-            ch = self._remove_locked(str(challenge_id))
-        if ch is None or ch.kind != kind or ch.conn_id != conn_id or ch.expires_at < time.monotonic():
-            return None
-        return ch
-
-    def drop_connection(self, conn_id: int) -> None:
-        with self._lock:
-            for cid in list(self._by_conn.get(conn_id, ())):
-                self._remove_locked(cid)
-
-    def purge_expired(self) -> None:
-        now = time.monotonic()
-        with self._lock:
-            while self._items:
-                first = next(iter(self._items.values()))
-                if first.expires_at >= now:
-                    break
-                self._remove_locked(first.challenge_id)
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._items)
-
-
-class ServerDHKey:
-    """The server's half of the verifier-wrap Diffie-Hellman, reused for a short time.
-
-    A 2048-bit DH key costs about 3 ms of CPU while holding the GIL. Making a
-    fresh one for every challenge would let anyone stall the whole server by
-    asking for registration challenges. Every client still uses a fresh key,
-    so every shared secret (and therefore every pad) is still unique.
-    """
-
-    def __init__(self, lifetime_seconds: float = 60.0, max_uses: int = 200) -> None:
-        self.lifetime = lifetime_seconds
-        self.max_uses = max_uses
-        self._lock = threading.Lock()
-        self._current: Optional[Tuple[int, str]] = None
-        self._born = 0.0
-        self._uses = 0
-
-    def get(self) -> Tuple[int, str]:
-        """Returns (private exponent, base64 public value)."""
-        with self._lock:
-            now = time.monotonic()
-            if self._current is None or now - self._born >= self.lifetime or self._uses >= self.max_uses:
-                private, public = scram.dh_keypair()
-                self._current, self._born, self._uses = (private, scram.dh_encode(public)), now, 0
-            self._uses += 1
-            return self._current
 
 
 class RateLimiter:
@@ -222,7 +95,7 @@ class LoginGuard:
         return max(0.0, recent[len(recent) - limit] + self.window - now)
 
     def retry_after(self, username: str, client: str, real: bool) -> float:
-        """Check only (before handing out a challenge). Never creates entries."""
+        """Check only, without recording an attempt. Never creates entries."""
         if self.max_failures <= 0:
             return 0.0
         key = (username, client) if real else client
@@ -268,8 +141,3 @@ class LoginGuard:
 def token_hash(token: uuid.UUID) -> bytes:
     """Sessions are stored by hash, so a database dump does not contain live tokens."""
     return hashlib.sha256(token.bytes).digest()
-
-
-def fake_salt(secret: bytes, username: str) -> bytes:
-    """Stable salt for usernames that do not exist, so a login attempt looks the same either way."""
-    return hmac.new(secret, f"fake-salt:{scram.canonical_username(username)}".encode(), hashlib.sha256).digest()[:scram.SALT_LEN]

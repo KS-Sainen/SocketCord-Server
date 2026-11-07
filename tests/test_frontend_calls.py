@@ -40,8 +40,8 @@ def test_rename_is_pushed_and_shows_in_the_online_list(server):
     b.drain_events()
     out = a.patch("users/profile", {"username": "Alicia"})
     assert out["user"]["username"] == "Alicia" and out["user"]["user_id"] == str(a.user_id)
-    assert set(out["user"]) == {"user_id", "username", "text_color", "text_bg_color", "online", "created_at"}
-    ev = b.wait_event("profile")
+    assert set(out["user"]) == {"user_id", "username", "text_color", "background", "online", "created_at"}
+    ev = b.wait_event("users/profile_changed")
     assert ev.data["user"]["user_id"] == str(a.user_id) and ev.data["user"]["username"] == "Alicia"
     online = {u["user_id"]: u["username"] for u in b.get("users/online")["users"]}
     assert online[str(a.user_id)] == "Alicia" and "alice" not in online.values()
@@ -55,21 +55,19 @@ def test_rename_then_log_in_with_the_new_name_only(server):
     a.patch("users/profile", {"username": "NewName"})
     again = server.client()
     done = again.login("newname", "pw-renamer")          # any case, the same password
-    assert done["user"]["username"] == "NewName" and done["user_id"] == str(a.user_id)
+    assert done["username"] == "NewName" and done["user_id"] == str(a.user_id)
     with pytest.raises(ApiFailure) as e:
         server.client().login("oldname", "pw-renamer")
     assert (e.value.status, e.value.data["error"]) == (251, "INVALID_CREDENTIALS")
     server.client().register("oldname", "pw-someone-else")   # the old name is free again
 
 
-def test_login_challenge_from_before_a_rename_fails(server):
+def test_login_after_a_password_change(server):
     a = server.user("quick", "pw-quick")
-    c = server.client()
-    flow = scram.LoginFlow("quick", "pw-quick", min_iterations=4096)
-    challenge = c.call(POST, "users/login", flow.start(), auth=False)
-    a.patch("users/profile", {"username": "quicker"})
-    reply = c.request(POST, "users/login", flow.respond(challenge), auth=False)
-    assert err(reply) == (251, "INVALID_CREDENTIALS")
+    a.patch("users/password", {"new_password": "pw-quicker"})
+    assert server.client().login("quick", "pw-quicker")["user_id"] == str(a.user_id)
+    reply = server.client().request(POST, "users/login", {"username": "quick", "password": "pw-quick"}, auth=False)
+    assert err(reply) == (251, "INVALID_CREDENTIALS")               # the old password is gone
 
 
 def test_rename_to_your_own_name_in_another_case(server):
@@ -93,16 +91,17 @@ def test_rename_refuses_taken_and_bad_names(server):
     assert (me["username"], me["text_color"]) == ("dave", "#171717")          # nothing changed
 
 
-def test_profile_takes_background_as_another_name_for_text_bg_color(server):
+def test_profile_takes_text_bg_color_as_another_name_for_background(server):
     a = server.user("painter")
-    out = a.patch("users/profile", {"username": "Neo", "text_color": "#FFFFFF", "background": "#AABBCC"})
-    assert (out["user"]["username"], out["user"]["text_color"], out["user"]["text_bg_color"]) == \
-        ("Neo", "#ffffff", "#aabbcc")
+    out = a.patch("users/profile", {"username": "Neo", "text_color": "#ffffff", "text_bg_color": "#aabbcc"})
+    assert (out["user"]["username"], out["user"]["text_color"], out["user"]["background"]) == \
+        ("Neo", "#FFFFFF", "#AABBCC")                                 # either case in, upper case out
     same = a.patch("users/profile", {"text_bg_color": "#112233", "background": "#112233"})
-    assert same["user"]["text_bg_color"] == "#112233"
+    assert same["user"]["background"] == "#112233".upper()
+    assert "text_bg_color" not in same["user"]
     reply = a.request(PATCH, "users/profile", {"text_bg_color": "#112233", "background": "#445566"})
     assert err(reply) == (250, "INVALID_FIELD") and reply.data["field"] == "background"
-    reply = a.request(PATCH, "users/profile", {"background": "#FFFFFF"})          # equals the text colour
+    reply = a.request(PATCH, "users/profile", {"background": "#ffffff"})          # equals the text colour
     assert err(reply) == (250, "INVALID_FIELD") and reply.data["field"] == "background"
     reply = a.request(PATCH, "users/profile", {"background": "blue"})
     assert err(reply) == (250, "INVALID_FIELD") and reply.data["field"] == "background"
@@ -180,9 +179,9 @@ def test_invitees_are_online_people_and_dm_peers_not_yet_in_the_group(server):
     assert out["chat_id"] == gid and out["query"] == "" and out["count"] == 2
     assert out["users"] == [
         {"user_id": str(online_b.user_id), "username": "Bea", "text_color": "#171717",
-         "text_bg_color": "#f2f2f2", "online": True},
+         "background": "#F2F2F2", "online": True},
         {"user_id": str(peer.user_id), "username": "peer_offline", "text_color": "#171717",
-         "text_bg_color": "#f2f2f2", "online": False},
+         "background": "#F2F2F2", "online": False},
     ]
     assert [u["username"] for u in me.get(f"chat/{gid}/invitees", {"query": "OFF"})["users"]] == ["peer_offline"]
     assert [u["username"] for u in me.get(f"chat/{gid}/invitees", {"query": " b "})["users"]] == ["Bea"]
@@ -226,17 +225,17 @@ def test_accept_invite_by_group_id(server):
     gid = a.post("chats", {"name": "Book Club"})["chat"]["chat_id"]
     rid = a.post(f"chat/{gid}/invite", {"user_id": str(b.user_id)})["request"]["request_id"]
     out = b.post(f"chat/{gid}/invite/accept")
-    assert out["path"] == f"chat/{gid}/invite/accept"
+    assert out["path"] == "chat/joined"
     assert out["chat"]["chat_id"] == gid and out["chat"]["role"] == "member" and out["chat"]["unread"] == 0
-    assert out["chat"]["last_message"]["content"] == "quin joined the group"
+    assert out["chat"]["pending"] is False and out["chat"]["last_message"]["text"] == "quin joined the group"
     assert {m["username"] for m in out["info"]["members"]} == {"pam", "quin"}
     assert out["info"]["joined"] is True and out["info"]["invited"] == []
     assert out["info"] == b.get(f"chat/{gid}/info")["chat"]                  # the same object as join's
     assert (out["request"]["request_id"], out["request"]["status"]) == (rid, "accepted")
-    ev = a.wait_event("request", match=lambda d: d["request"]["status"] == "accepted")
+    ev = a.wait_event("users/request", match=lambda d: d["request"]["status"] == "accepted")
     assert ev.data["request"]["request_id"] == rid
-    a.wait_event("message", match=lambda d: d["message"]["content"] == "quin joined the group")
-    watcher.wait_event("group_updated", match=lambda d: d["chat_id"] == gid and d["change"] == "joined")
+    a.wait_event("chat/new_message", match=lambda d: d["message"]["text"] == "quin joined the group")
+    watcher.wait_event("chat/members_changed", match=lambda d: d["chat_id"] == gid and d["change"] == "joined")
     assert b.get("users/requests")["incoming"] == []
     again = b.request(POST, f"chat/{gid}/invite/accept")
     assert err(again) == (253, "REQUEST_NOT_FOUND")                          # nothing left to accept
@@ -248,9 +247,9 @@ def test_reject_invite_by_group_id(server):
     gid = a.post("chats", {"name": "Not For Me"})["chat"]["chat_id"]
     rid = a.post(f"chat/{gid}/invite", {"user_id": str(b.user_id)})["request"]["request_id"]
     out = b.post(f"chat/{gid}/invite/reject")
-    assert (out["chat_id"], out["status"]) == (gid, "declined")
+    assert (out["path"], out["chat_id"], out["status"]) == ("chat/declined", gid, "declined")
     assert (out["request"]["request_id"], out["request"]["status"]) == (rid, "declined")
-    ev = a.wait_event("request", match=lambda d: d["request"]["status"] == "declined")
+    ev = a.wait_event("users/request", match=lambda d: d["request"]["status"] == "declined")
     assert ev.data["request"]["request_id"] == rid
     assert {m["username"] for m in a.get(f"chat/{gid}/info")["chat"]["members"]} == {"sara"}
     assert b.get("users/requests")["incoming"] == []
@@ -325,18 +324,20 @@ def test_first_dm_opens_the_room_at_once_by_default(server):
     assert server.config.dm_require_accept is False
     a, b = server.user("zack"), server.user("ziva")
     out = a.post(f"users/{b.user_id}/dm", {"message": "hey ziva"})
-    assert out["status"] == "sent" and out["request"] is None and out["chat"]["peer"]["username"] == "ziva"
+    assert out["path"] == "chats/dm" and out["status"] == "sent" and out["request"] is None
+    assert out["chat"]["peer"]["username"] == "ziva"
     dm_id = out["chat_id"]
-    assert [m["content"] for m in out["messages"]] == ["hey ziva"]
-    opened = b.wait_event("chat", match=lambda d: d["reason"] == "dm_opened")
-    assert opened.data["chat"]["chat_id"] == dm_id and opened.data["chat"]["name"] == "zack"
-    ev = b.wait_event("message")
-    assert (ev.data["chat_id"], ev.data["message"]["content"]) == (dm_id, "hey ziva")
+    assert [m["text"] for m in out["messages"]] == ["hey ziva"]
+    opened = b.wait_event("chats/new", match=lambda d: d["chat"]["chat_id"] == dm_id)
+    assert opened.data["chat"]["name"] == "zack" and opened.data["chat"]["pending"] is False
+    assert opened.data["chat"]["is_dm"] is True
+    ev = b.wait_event("chat/new_message")
+    assert (ev.data["chat_id"], ev.data["message"]["text"]) == (dm_id, "hey ziva")
     assert b.get("users/requests")["incoming"] == []
     again = a.post(f"users/{b.user_id}/dm", {"message": "still there?"})        # the same room is reused
     back = b.post(f"users/{a.user_id}/dm", {"message": "yes"})
     assert again["chat_id"] == back["chat_id"] == dm_id
-    assert [m["content"] for m in a.get(f"chat/{dm_id}/messages")["messages"]] == ["hey ziva", "still there?", "yes"]
+    assert [m["text"] for m in a.get(f"chat/{dm_id}/messages")["messages"]] == ["hey ziva", "still there?", "yes"]
 
 
 def test_dm_still_needs_accepting_when_configured(make_server):
@@ -344,7 +345,7 @@ def test_dm_still_needs_accepting_when_configured(make_server):
     a, b = srv.user("adam"), srv.user("bree")
     out = a.post(f"users/{b.user_id}/dm", {"message": "may I?"})
     assert (out["status"], out["chat_id"]) == ("pending", None)
-    ev = b.wait_event("request")
+    ev = b.wait_event("users/request")
     assert ev.data["request"]["message"] == "may I?"
     reply = a.request(GET, f"chat/{out['request']['request_id']}/messages")
     assert err(reply) == (253, "CHAT_NOT_FOUND")                           # no room until bree accepts
@@ -358,10 +359,10 @@ def test_a_request_left_over_from_accept_mode_opens_with_the_next_dm(server):
     b.drain_events()
     out = a.post(f"users/{b.user_id}/dm", {"message": "hello again"})
     assert out["status"] == "sent" and out["chat_id"] == str(old.chat_id)
-    assert [m["content"] for m in out["messages"]] == ["sent while approval was on", "hello again"]
+    assert [m["text"] for m in out["messages"]] == ["sent while approval was on", "hello again"]
     assert out["request"]["status"] == "accepted"
-    b.wait_event("chat", match=lambda d: d["reason"] == "dm_opened")
-    b.wait_event("request", match=lambda d: d["request"]["status"] == "accepted")
-    texts = [m["content"] for m in b.get(f"chat/{old.chat_id}/messages")["messages"]]
+    b.wait_event("chats/new", match=lambda d: d.get("reason") == "dm_opened")
+    b.wait_event("users/request", match=lambda d: d["request"]["status"] == "accepted")
+    texts = [m["text"] for m in b.get(f"chat/{old.chat_id}/messages")["messages"]]
     assert texts == ["sent while approval was on", "hello again"]
     assert b.get("users/requests")["incoming"] == [] and a.get("users/requests")["outgoing"] == []

@@ -55,7 +55,7 @@ def test_main_entry_point_serves(monkeypatch):
     assert _wait_until(lambda: "server" in built and built["server"].address is not None)
     server = built["server"]
     try:
-        c = SocketCordClient(*server.address, min_iterations=4096)
+        c = SocketCordClient(*server.address)
         c.register("entry", "pw")
         c.login("entry", "pw")
         assert c.get("users/info")["user"]["username"] == "entry"
@@ -79,10 +79,13 @@ def test_reset_before_accept_does_not_stop_the_server(server):
     assert c.get("users/info")["user"]["username"] == "after_rst"
 
 
-# ---------------------------------------------------------------------- 2. the verifier stays secret
+# ---------------------------------------------------------------------- 2. the stored hash stays on the server
 
-def test_verifier_never_crosses_the_wire(server):
+def test_the_stored_hash_never_crosses_the_wire(server):
+    """The password itself is sent (contract v2), but the salt, the iteration count
+    and the keys derived from it are the server's own business."""
     c = server.client()
+    received = bytearray()
     sent = bytearray()
     original = c.send_raw
 
@@ -91,16 +94,18 @@ def test_verifier_never_crosses_the_wire(server):
         original(data)
 
     c.send_raw = spy
+    c.on_event = lambda ev: received.extend(ev.msg.encode())
     c.register("sniffme", "first-password")
     first = server.app.repo.get_user_by_username("sniffme")
     c.login("sniffme", "first-password")
-    c.change_password("first-password", "second-password")
+    received.extend(str(c.change_password("second-password")).encode())
     second = server.app.repo.get_user(first.user_id)
-    assert second.stored_key != first.stored_key
-    for secret in (first.stored_key, first.server_key, second.stored_key, second.server_key):
-        assert secret not in sent and scram.b64e(secret).encode() not in sent
-    # Neither the keys nor a proof that could be XORed with them are sent at registration.
-    assert b'"stored_key"' not in sent and b'"new_client_proof"' not in sent
+    assert second.stored_key != first.stored_key and second.salt != first.salt
+    for secret in (first.stored_key, first.server_key, second.stored_key, second.server_key,
+                   first.salt, second.salt):
+        for wire in (sent, received):
+            assert secret not in wire and scram.b64e(secret).encode() not in wire
+    assert b'"salt"' not in sent and b'"iterations"' not in sent
 
 
 # ---------------------------------------------------------------------- 3. dead sessions get nothing
@@ -112,7 +117,7 @@ def test_logout_unbinds_every_connection_of_that_session(server):
     twin.get("chats")                                   # same session, second connection
     watcher = server.user("watcher1")
     a.post("users/logout")
-    watcher.wait_event("presence", match=lambda d: d["user"]["username"] == "multi" and not d["online"])
+    watcher.wait_event("users/status", match=lambda d: d["user"]["username"] == "multi" and not d["online"])
     assert "multi" not in {u["username"] for u in watcher.get("users/online")["users"]}
     assert twin.request(GET, "chats").status == 251
 
@@ -144,20 +149,16 @@ def test_session_needs_the_verifier_it_was_checked_against(repo):
     assert repo.create_session(b"b" * 32, user.user_id, expires, expected_verifier=user.password_hash) is not None
 
 
-# ---------------------------------------------------------------------- 4. throttle with pre-fetched challenges
+# ---------------------------------------------------------------------- 4. the login throttle counts every attempt
 
-def test_prefetched_challenges_do_not_buy_extra_guesses(server):
+def test_more_connections_do_not_buy_extra_guesses(server):
     server.client().register("throttled", "right-pw")
-    prepared = []
-    for c in [server.client() for _ in range(3)]:
-        for _ in range(3):
-            flow = scram.LoginFlow("throttled", "wrong-pw", min_iterations=4096)
-            prepared.append((c, flow, c.call(POST, "users/login", flow.start(), auth=False)))
-    errors = [c.request(POST, "users/login", flow.respond(ch), auth=False).data["error"]
-              for c, flow, ch in prepared]
+    attempts = [(c, {"username": "throttled", "password": "wrong-pw"})
+                for c in [server.client() for _ in range(3)] for _ in range(3)]
+    errors = [c.request(POST, "users/login", body, auth=False).data["error"] for c, body in attempts]
     limit = server.config.login_max_failures
     assert errors[:limit] == ["INVALID_CREDENTIALS"] * limit
-    assert set(errors[limit:]) == {"TOO_MANY_ATTEMPTS"}
+    assert set(errors[limit:]) == {"RATE_LIMITED"}
 
 
 # ---------------------------------------------------------------------- 5. strings that cannot be stored
@@ -180,14 +181,16 @@ def test_fallback_error_reply_keeps_rid():
             pass
 
         def dispatch(self, peer, frame):
-            return ReplyCord.from_dict(200, {"path": "chats", "rid": 9, "oops": "\ud800"})
+            return ReplyCord.from_dict(200, {"path": "chats/list", "rid": 9, "oops": "\ud800"})
 
     srv = SocketCordServer(BrokenApp(), "127.0.0.1", 0)
     try:
         srv._handle(Peer(1, "127.0.0.1", 1), Frame(url_hint="chats"))
         _, _, data = srv._outq.get_nowait()
         reply = ReplyCord.unpack(data)
-        assert reply.status == 254 and reply.data["rid"] == 9 and reply.data["path"] == "chats"
+        assert reply.status == 254 and reply.data["rid"] == 9
+        # The reply it replaces never went out, so this error says "chats", not "chats/list".
+        assert reply.data["path"] == "chats"
     finally:
         srv._teardown()
 
@@ -293,7 +296,7 @@ def test_presence_events_end_in_the_true_state():
     last = {}
     for cid, data in sent:
         reply = ReplyCord.unpack(data)
-        if cid == 0 and reply.path == "event/presence":
+        if cid == 0 and reply.path == "users/status":
             last[reply.data["user"]["user_id"]] = reply.data["online"]
     for u in users:
         assert last.get(str(u.user_id), False) == hub.is_online(u.user_id)
@@ -400,19 +403,19 @@ def test_catch_up_by_after_id_never_skips_a_message(server):
 
     def post_all(client):
         for j in range(per_poster):
-            posted.append(client.post(f"chat/{gid}/message", {"content": f"m{j}"})["message"]["message_id"])
+            posted.append(client.post(f"chat/{gid}/message", {"content": f"m{j}"})["message"]["id"])
 
     # Read the starting point BEFORE any poster runs (reading it inside the poller
     # raced with the first posts and made this test flaky).
-    start = max(m["message_id"] for m in owner.get(f"chat/{gid}/messages")["messages"])
+    start = max(m["id"] for m in owner.get(f"chat/{gid}/messages")["messages"])
 
     def poll():
         last = start
         while True:
             finished = done.is_set()
             for m in owner.get(f"chat/{gid}/messages", {"after_id": last, "count": 200})["messages"]:
-                seen.append(m["message_id"])
-                last = max(last, m["message_id"])
+                seen.append(m["id"])
+                last = max(last, m["id"])
             if finished:
                 return
 

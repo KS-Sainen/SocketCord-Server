@@ -7,10 +7,11 @@ Two uses:
        python3 client/socketcord_client.py --host 127.0.0.1 --port 8080
 
 2. A worked example for the GUI. It sends exactly what the GUI has to send,
-   including the two-step challenge-response for register/login/password.
-   Its read loop mirrors network.py: packets go into a buffer, complete ones
-   are parsed, "event/..." packets are pushes, everything else is a reply
-   matched to its request by the "rid" the client put in the request.
+   including the password in clear text on register, login and password change
+   (wire contract v2; the socket is not encrypted). Its read loop mirrors
+   network.py: packets go into a buffer, complete ones are parsed, a packet
+   with no "method" is a server push, everything else is a reply matched to
+   its request by the "rid" the client put in the request.
 """
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ from socketcord import scram  # noqa: E402
 from socketcord.protocol import GET, NIL_UUID, PATCH, POST, ReplyCord, ReplyParser, RequestCord  # noqa: E402
 
 
+AUTO_DEVICE = object()   # register(): send scram.device_fingerprint()
+
+
 class ApiFailure(Exception):
     def __init__(self, reply: ReplyCord, note: str = "") -> None:
         self.reply = reply
@@ -41,14 +45,12 @@ class ApiFailure(Exception):
 
 class SocketCordClient:
     def __init__(self, host: str, port: int, timeout: float = 10.0,
-                 on_event: Optional[Callable[[ReplyCord], None]] = None,
-                 min_iterations: int = scram.CLIENT_MIN_ITERATIONS) -> None:
+                 on_event: Optional[Callable[[ReplyCord], None]] = None) -> None:
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(None)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.timeout = timeout
         self.on_event = on_event
-        self.min_iterations = min_iterations   # refuse challenges asking for weaker PBKDF2
         self.user_id = NIL_UUID
         self.token = NIL_UUID
         self.username: Optional[str] = None
@@ -62,7 +64,6 @@ class SocketCordClient:
         self._reader = threading.Thread(target=self._read_loop, name="socketcord-reader", daemon=True)
         self._reader.start()
 
-    # ------------------------------------------------------------------ transport
     def close(self) -> None:
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
@@ -90,7 +91,7 @@ class SocketCordClient:
                 for item in parser.feed(data):
                     if isinstance(item, ValueError):
                         continue
-                    if item.path.startswith("event/"):
+                    if "method" not in item.data:      # a push; see protocol.PUSH_PATHS
                         with self._cond:
                             self._events.append(item)
                             self._cond.notify_all()
@@ -136,9 +137,9 @@ class SocketCordClient:
                 return self._unmatched.pop(0)
         raise TimeoutError("no reply")
 
-    def wait_event(self, name: str, timeout: float = 5.0,
+    def wait_event(self, path: str, timeout: float = 5.0,
                    match: Optional[Callable[[dict], bool]] = None) -> ReplyCord:
-        path = f"event/{name}"
+        """The next push with this `path` (one of protocol.PUSH_PATHS)."""
 
         def find() -> Optional[int]:
             for i, ev in enumerate(self._events):
@@ -158,7 +159,6 @@ class SocketCordClient:
             out, self._events = self._events, []
             return out
 
-    # ------------------------------------------------------------------ requests
     def request(self, method: int, url: str, data: Optional[dict] = None, auth: bool = True,
                 timeout: Optional[float] = None) -> ReplyCord:
         rid = self.next_rid()
@@ -187,50 +187,33 @@ class SocketCordClient:
     def patch(self, url: str, data: Optional[dict] = None) -> dict:
         return self.call(PATCH, url, data)
 
-    # ------------------------------------------------------------------ challenge-response flows
-    def register(self, username: str, password: str, device_id=scram.AUTO_DEVICE) -> dict:
+    # The password travels in the message body as clear text, on an unencrypted
+    # socket (contract v2 section 1). The server hashes it and stores only the hash.
+    def register(self, username: str, password: str, device_id=AUTO_DEVICE) -> dict:
         """device_id defaults to a hash of this machine's MAC; pass None to send none."""
-        flow = scram.RegisterFlow(username, password, device_id, min_iterations=self.min_iterations)
-        challenge = self.call(POST, "users", flow.start(), auth=False)
-        reply = self.request(POST, "users", flow.respond(challenge), auth=False)
-        if not reply.ok:
-            raise ApiFailure(reply)
-        if not flow.verify(reply.data):
-            raise ApiFailure(reply, "server signature is wrong: this is not the server you registered with")
-        return reply.data
+        msg = {"username": username, "password": password}
+        if device_id is AUTO_DEVICE:
+            device_id = scram.device_fingerprint()
+        if device_id:
+            msg["device_id"] = device_id
+        return self.call(POST, "users", msg, auth=False)
 
     def login(self, username: str, password: str) -> dict:
-        flow = scram.LoginFlow(username, password, min_iterations=self.min_iterations)
-        challenge = self.call(POST, "users/login", flow.start(), auth=False)
-        reply = self.request(POST, "users/login", flow.respond(challenge), auth=False)
-        if not reply.ok:
-            raise ApiFailure(reply)
-        if not flow.verify(reply.data):
-            raise ApiFailure(reply, "server signature is wrong: the server does not know this account")
-        self.user_id = uuid.UUID(reply.data["user_id"])
-        self.token = uuid.UUID(reply.data["session_token"])
-        self.username = reply.data["user"]["username"]
-        return reply.data
+        data = self.call(POST, "users/login", {"username": username, "password": password}, auth=False)
+        self.user_id = uuid.UUID(data["user_id"])
+        self.token = uuid.UUID(data["session_token"])
+        self.username = data["username"]
+        return data
 
-    def change_password(self, old_password: str, new_password: str) -> dict:
-        flow = scram.ChangePasswordFlow(str(self.user_id), old_password, new_password,
-                                        min_iterations=self.min_iterations)
-        challenge = self.patch("users/profile/password", flow.start())
-        reply = self.request(PATCH, "users/profile/password", flow.respond(challenge))
-        if not reply.ok:
-            raise ApiFailure(reply)
-        if not flow.verify(reply.data):
-            raise ApiFailure(reply, "server signature is wrong")
-        # The password change replaced the session token: use the new one from now on.
-        self.token = uuid.UUID(reply.data["session_token"])
-        return reply.data
+    def change_password(self, new_password: str) -> dict:
+        """No current password is asked for, and the session token does not change."""
+        return self.patch("users/password", {"new_password": new_password})
 
     def logout(self) -> dict:
         data = self.post("users/logout")
         self.user_id, self.token, self.username = NIL_UUID, NIL_UUID, None
         return data
 
-    # ------------------------------------------------------------------ AI summary
     # Claude needs a few seconds (the server allows up to about 2 x AI_TIMEOUT_SECONDS),
     # so this call waits longer than the others.
     SUMMARY_TIMEOUT = 90.0
@@ -241,8 +224,6 @@ class SocketCordClient:
         return self.get(f"chat/{chat_id}/summary", {"mode": mode, "count": count, "language": language},
                         timeout=timeout)
 
-
-# ---------------------------------------------------------------------- terminal client
 
 HELP = """commands:
   register <name> [password]      login <name> [password]       logout      passwd
@@ -259,14 +240,13 @@ HELP = """commands:
 
 def _print_event(ev: ReplyCord) -> None:
     d = dict(ev.data)
-    name = d.pop("path", "")[len("event/"):]
-    if name == "message":
+    name = d.pop("path", "")
+    if name == "chat/new_message":
         m = d["message"]
-        who = (m.get("sender") or {}).get("username", "*")
-        print(f"\n[{d['chat_id'][:8]}] {who}: {m['content']}")
-    elif name == "presence":
+        print(f"\n[{d['chat_id'][:8]}] {m['sender'] or '*'}: {m['text']}")
+    elif name == "users/status":
         print(f"\n* {d['user']['username']} is {'online' if d['online'] else 'offline'}")
-    elif name == "request":
+    elif name == "users/request":
         r = d["request"]
         what = f"DM: {r.get('message')!r}" if r["kind"] == "dm" else f"invite to {r['chat']['name']}"
         print(f"\n* request {r['request_id']} from {r['from']['username']} ({what}) is {r['status']}")
@@ -322,13 +302,11 @@ def repl(host: str, port: int) -> None:
                     _show(client.register(args[0], password))
                 else:
                     data = client.login(args[0], password)
-                    print(f"logged in as {data['user']['username']} ({data['user_id']})")
+                    print(f"logged in as {data['username']} ({data['user_id']})")
             elif cmd == "logout":
                 _show(client.logout())
             elif cmd == "passwd":
-                old = getpass.getpass("current password: ")
-                new = getpass.getpass("new password: ")
-                _show(client.change_password(old, new))
+                _show(client.change_password(getpass.getpass("new password: ")))
             elif cmd == "online":
                 for u in client.get("users/online")["users"]:
                     print(f"  {u['username']}{' (you)' if u['is_self'] else ''}  {u['user_id']}")
@@ -350,8 +328,7 @@ def repl(host: str, port: int) -> None:
             elif cmd == "history":
                 count = int(args[1]) if len(args) > 1 else 20
                 for m in client.get(f"chat/{args[0]}/messages", {"count": count})["messages"]:
-                    who = (m.get("sender") or {}).get("username", "*")
-                    print(f"  {m['created_at']}  {who}: {m['content']}")
+                    print(f"  {m['time']}  {m['sender'] or '*'}: {m['text']}")
             elif cmd == "read":
                 _show(client.post(f"chat/{args[0]}/read"))
             elif cmd == "summary":
@@ -377,12 +354,12 @@ def repl(host: str, port: int) -> None:
             elif cmd == "profile":
                 colours = {"text_color": args[0]}
                 if len(args) > 1:
-                    colours["text_bg_color"] = args[1]
+                    colours["background"] = args[1]
                 _show(client.patch("users/profile", colours))
             elif cmd == "search":
                 for u in client.get("users/search", {"query": args[0] if args else ""})["users"]:
                     print(f"  {u['username']}{' (you)' if u['is_self'] else ''}  {u['user_id']}  "
-                          f"{u['text_color']} on {u['text_bg_color']}{'  online' if u['online'] else ''}")
+                          f"{u['text_color']} on {u['background']}{'  online' if u['online'] else ''}")
             elif cmd == "raw":
                 if args[0].upper() not in methods:
                     raise ValueError("method must be GET, POST or PATCH")

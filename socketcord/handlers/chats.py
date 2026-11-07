@@ -10,9 +10,9 @@ from ..router import RequestContext, bad_request, forbidden, not_found, ok
 from ..views import chat_item_view, group_view, marker, message_view, ref_of, request_view, user_view
 from . import router
 from .common import (MAX_MESSAGE_LEN, after_join, announce_membership, announce_pending, announce_request,
-                     answer_request, chat_info_for, chat_item,
-                     check_request_limits, get_chat_or_404, group_item, hide_foreign_dm, limit, post_message,
-                     require_member)
+                     answer_request, chat_info_for, chat_item, check_request_limits, get_chat_or_404,
+                     group_item, hide_foreign_dm, limit, pending_chat_rows, post_message, require_member,
+                     spelled)
 
 GROUP_PAGE_DEFAULT, GROUP_PAGE_MAX = 100, 200
 CHAT_PAGE_MAX = 200
@@ -21,19 +21,21 @@ SEARCH_MAX_LEN = 50
 INVITEES_MAX = 50               # GET chat/{chat_id}/invitees answers at most this many people
 
 
-@router.route(GET, "chats")
+@router.route(GET, "chats", path="chats/list")
 def my_chats(ctx: RequestContext) -> ReplyCord:
-    """Every chat the caller is in, most recent activity first, with unread counts.
-    Paged with `count` (default and max 200) and `offset`."""
+    """Every chat the caller is in, plus the group invitations they have not answered
+    (`pending`: true), most recent activity first, with unread counts. Paged with
+    `count` (default and max 200) and `offset`."""
     count = ctx.int_field("count", required=False, minimum=1, maximum=CHAT_PAGE_MAX, default=CHAT_PAGE_MAX)
     offset = ctx.int_field("offset", required=False, minimum=0, maximum=10_000_000, default=0)
-    items = ctx.repo.list_user_chats(ctx.user.user_id)
-    page = items[offset:offset + count]
-    return ok({"chats": [chat_item_view(i, ctx.hub) for i in page], "offset": offset,
-               "has_more": offset + count < len(items)})
+    rows = [chat_item_view(i, ctx.hub) for i in ctx.repo.list_user_chats(ctx.user.user_id)]
+    rows += pending_chat_rows(ctx)
+    rows.sort(key=lambda r: r["last_activity"], reverse=True)
+    return ok({"chats": rows[offset:offset + count], "offset": offset,
+               "has_more": offset + count < len(rows)})
 
 
-@router.route(POST, "chats")
+@router.route(POST, "chats", path="chats/created")
 def create_group(ctx: RequestContext) -> ReplyCord:
     """R8: a new group starts with only its creator as a member."""
     name = ctx.str_field("name", max_len=64)
@@ -47,8 +49,8 @@ def create_group(ctx: RequestContext) -> ReplyCord:
     with ctx.app.chat_lock(chat_id):
         chat = ctx.repo.create_group(name, description, ctx.user.user_id, chat_id=chat_id)
         view = group_view(group_item(ctx, chat), ctx.hub, ctx.user.user_id)
-        ctx.hub.push_all(ReplyCord.event("group_created",
-                                         {"group": {k: v for k, v in view.items() if k != "joined"}}),
+        ctx.hub.push_all(ReplyCord.push("chats/group_created",
+                                        {"group": {k: v for k, v in view.items() if k != "joined"}}),
                          exclude_conn=ctx.peer.conn_id)
     # "chat" has the GET chats shape (for the chat list); "group" the GET chats/groups shape.
     return ok({"chat": chat_item(ctx, ctx.user.user_id, chat.chat_id), "group": view})
@@ -66,7 +68,7 @@ def all_groups(ctx: RequestContext) -> ReplyCord:
                "offset": offset, "has_more": has_more})
 
 
-@router.route(GET, "chat/{chat_id:uuid}/info")
+@router.route(GET, "chat/{chat_id:uuid}/info", path="chat/info")
 def chat_info(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     chat = get_chat_or_404(ctx, chat_id)
     hide_foreign_dm(ctx, chat)
@@ -79,7 +81,7 @@ def _message_query(ctx: RequestContext) -> MessageQuery:
         count=ctx.int_field("count", required=False, minimum=1, maximum=200, default=50),
         before_id=ctx.uuid_field("before_id", required=False),
         after_id=ctx.uuid_field("after_id", required=False),
-        content=ctx.str_field("content", required=False, max_len=SEARCH_MAX_LEN),
+        content=ctx.str_field(spelled(ctx, "content", "text"), required=False, max_len=SEARCH_MAX_LEN),
     )
     # README filter "time": a timestamp (= messages before it) or {"before": t, "after": t}.
     t = body.get("time")
@@ -96,7 +98,7 @@ def _message_query(ctx: RequestContext) -> MessageQuery:
     return q
 
 
-@router.route(GET, "chat/{chat_id:uuid}/messages")
+@router.route(GET, "chat/{chat_id:uuid}/messages", path="chat/messages")
 def chat_messages(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     """Recent messages, oldest first. Only members can read them (R7/R11)."""
     chat = get_chat_or_404(ctx, chat_id)
@@ -106,32 +108,33 @@ def chat_messages(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     first_unread = ctx.repo.first_message_after(chat_id, member.last_read_message_id)
     return ok({"chat_id": chat_id, "messages": [message_view(m) for m in messages], "has_more": has_more,
                "last_read_message_id": marker(member.last_read_message_id),
-               "first_unread_message_id": first_unread})
+               "first_unread_id": first_unread})
 
 
-@router.route(POST, "chat/{chat_id:uuid}/message")
+@router.route(POST, "chat/{chat_id:uuid}/message", path="chat/sent")
 def send_message(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
-    """R7/R11: post to a chat you are in; every online member gets event/message."""
+    """R7/R11: post to a chat you are in; every online member gets chat/new_message."""
     chat = get_chat_or_404(ctx, chat_id)
     require_member(ctx, chat)
-    content = ctx.str_field("content", max_len=MAX_MESSAGE_LEN, strip=False, multiline=True)
+    key = spelled(ctx, "content", "text")      # the reply spells it "text"
+    content = ctx.str_field(key, max_len=MAX_MESSAGE_LEN, strip=False, multiline=True)
     if not content.strip():
-        raise bad_request("INVALID_FIELD", "'content' cannot be blank", field="content")
+        raise bad_request("INVALID_FIELD", f"'{key}' cannot be blank", field=key)
     limit(ctx, ctx.app.message_limiter, "sending messages")
     msg = post_message(ctx, chat, content, ctx.user.user_id)
     return ok({"message": message_view(msg)})
 
 
-@router.route(POST, "chat/{chat_id:uuid}/read")
+@router.route(POST, "chat/{chat_id:uuid}/read", path="chat/read")
 def mark_read(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     chat = get_chat_or_404(ctx, chat_id)
     require_member(ctx, chat)
-    message_id = ctx.uuid_field("message_id", required=False)
+    message_id = ctx.uuid_field(spelled(ctx, "message_id", "id"), required=False)
     last = ctx.repo.mark_read(chat_id, ctx.user.user_id, message_id)
     return ok({"chat_id": chat_id, "last_read_message_id": marker(last)})
 
 
-@router.route(POST, "chat/{chat_id:uuid}/invite")
+@router.route(POST, "chat/{chat_id:uuid}/invite", path="chat/invited")
 def invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     """Invite someone to a group. They are added only if they accept (R10)."""
     chat = get_chat_or_404(ctx, chat_id)
@@ -189,7 +192,7 @@ def _my_invite(ctx: RequestContext, chat_id: UUID) -> ChatRequest:
     return invite
 
 
-@router.route(POST, "chat/{chat_id:uuid}/invite/accept")
+@router.route(POST, "chat/{chat_id:uuid}/invite/accept", path="chat/joined")
 def accept_invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     """Accept your pending invitation to a group: the same as
     POST users/requests/{request_id}/accept on that invite, and the same reply as
@@ -205,7 +208,7 @@ def accept_invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     return ok({"chat": result["chat"], "info": result["info"], "request": result["request"]})
 
 
-@router.route(POST, "chat/{chat_id:uuid}/invite/reject")
+@router.route(POST, "chat/{chat_id:uuid}/invite/reject", path="chat/declined")
 def reject_invite(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
     """Decline your pending invitation to a group: the same as
     POST users/requests/{request_id}/decline on that invite."""
@@ -253,7 +256,7 @@ def leave(ctx: RequestContext, chat_id: UUID) -> ReplyCord:
             raise forbidden("NOT_A_MEMBER", "you are not in this group")
         if deleted:
             # The last member left, so the group is gone.
-            ctx.hub.push_all(ReplyCord.event("group_deleted", {"chat_id": chat_id}))
+            ctx.hub.push_all(ReplyCord.push("chats/group_deleted", {"chat_id": chat_id}))
         else:
             try:
                 post_message(ctx, chat, f"{ctx.user.username} left the group", sender_id=None,

@@ -6,8 +6,6 @@ matches nothing gets 253 Not Found.
 """
 from __future__ import annotations
 
-import base64
-import binascii
 import re
 import unicodedata
 import uuid
@@ -55,8 +53,6 @@ def normalize_url(url: str) -> str:
     return url.strip().strip("/")
 
 
-# ---------------------------------------------------------------------- routes
-
 _CONVERTERS: Dict[str, Callable[[str], Any]] = {"str": str, "uuid": uuid.UUID, "int": int}
 
 
@@ -66,6 +62,9 @@ class Route:
     pattern: str
     handler: Callable[..., ReplyCord]
     auth: bool
+    # The semantic name every reply to this route carries as "path" (contract v2
+    # section 2), errors included. None: the reply echoes the request URL.
+    path: Optional[str] = None
     parts: List[Tuple[str, Optional[str], Optional[str]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -103,9 +102,9 @@ class Router:
     def __init__(self) -> None:
         self.routes: List[Route] = []
 
-    def route(self, method: int, pattern: str, auth: bool = True) -> Callable:
+    def route(self, method: int, pattern: str, auth: bool = True, path: Optional[str] = None) -> Callable:
         def register(fn: Callable[..., ReplyCord]) -> Callable[..., ReplyCord]:
-            self.routes.append(Route(method, pattern, fn, auth))
+            self.routes.append(Route(method, pattern, fn, auth, path))
             # Literal segments win over parameters, e.g. users/online before users/{user_id}.
             self.routes.sort(key=lambda r: -r.literal_count)
             return fn
@@ -124,8 +123,6 @@ class Router:
                 return route, params
         return None
 
-
-# ---------------------------------------------------------------------- request context
 
 @dataclass
 class RequestContext:
@@ -205,18 +202,6 @@ class RequestContext:
             return uuid.UUID(str(value))
         except ValueError:
             raise bad_request("INVALID_FIELD", f"'{key}' must be a UUID", field=key) from None
-
-    def b64_field(self, key: str, length: Optional[int] = None) -> bytes:
-        value = self.body.get(key)
-        if value is None:
-            raise bad_request("MISSING_FIELD", f"'{key}' is required", field=key)
-        try:
-            raw = base64.b64decode(str(value).encode("ascii"), validate=True)
-        except (binascii.Error, UnicodeEncodeError):
-            raise bad_request("INVALID_FIELD", f"'{key}' must be base64", field=key) from None
-        if length is not None and len(raw) != length:
-            raise bad_request("INVALID_FIELD", f"'{key}' must decode to {length} bytes", field=key)
-        return raw
 
     def time_field(self, value: Any, key: str) -> datetime:
         """Accepts ISO 8601 ("2026-11-05T10:00:00Z", "...+07:00", date only) or epoch seconds."""

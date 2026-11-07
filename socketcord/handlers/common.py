@@ -12,11 +12,23 @@ from typing import Iterable, Optional
 from ..db.base import Chat, ChatRequest, GroupListItem, Member, Message, MessageQuery, UserRef, UUID
 from ..protocol import ReplyCord
 from ..router import RequestContext, bad_request, forbidden, not_found
-from ..views import chat_info_view, chat_item_view, message_view, ref_of, request_view, user_ref
+from ..views import (chat_info_view, chat_item_view, invited_chat_view, message_view, ref_of,
+                     request_view, user_ref)
 
 MAX_MESSAGE_LEN = 4000
 MEMBERS_IN_CHAT_INFO = 500      # members (and pending invites, shown to members) in a chat info object
+PENDING_ROWS_MAX = 50           # invitations shown as pending rows in GET chats
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{3,32}$")
+
+
+def spelled(ctx: RequestContext, primary: str, *aliases: str) -> str:
+    """The name the caller used for a field that has more than one accepted spelling
+    (the reply's word and the older one). `primary` wins if both are sent, and names
+    the field in a MISSING_FIELD error."""
+    for key in (primary, *aliases):
+        if ctx.has(key):
+            return key
+    return primary
 
 
 def username_field(ctx: RequestContext, required: bool = True) -> Optional[str]:
@@ -72,8 +84,8 @@ def post_message(ctx: RequestContext, chat: Chat, content: str, sender_id: Optio
             ctx.repo.mark_read(chat.chat_id, sender_id, msg.message_id)  # your own message counts as read
         members = ctx.repo.get_members(chat.chat_id)
         ctx.hub.push([m.user_id for m in members],
-                     ReplyCord.event("message", {"chat_id": chat.chat_id, "chat_kind": chat.kind,
-                                                 "message": message_view(msg)}),
+                     ReplyCord.push("chat/new_message", {"chat_id": chat.chat_id, "chat_kind": chat.kind,
+                                                         "message": message_view(msg)}),
                      exclude_conn=ctx.peer.conn_id if exclude_origin else None)
     return msg
 
@@ -88,6 +100,24 @@ def chat_info_for(ctx: RequestContext, chat: Chat) -> dict:
                           invited=invited, invited_total=total)
 
 
+def pending_chat_rows(ctx: RequestContext, limit: int = PENDING_ROWS_MAX) -> list:
+    """Group invitations the caller has not answered yet, as chat rows with
+    pending = true, so GET chats shows them even if the push was missed (the
+    invitation arrived while the client was offline)."""
+    incoming, _ = ctx.repo.list_pending_requests(ctx.user.user_id)
+    rows = []
+    for req in incoming:
+        if req.kind != "invite":
+            continue            # a DM request has no room yet; it is in GET users/requests
+        chat = ctx.repo.get_chat(req.chat_id)
+        if chat is None:
+            continue            # the group was deleted a moment ago
+        rows.append(invited_chat_view(chat, req.created_at, len(ctx.repo.get_members(req.chat_id))))
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def chat_item(ctx: RequestContext, user_id: UUID, chat_id: UUID) -> Optional[dict]:
     """The chat as it appears in that user's GET chats list (None if they are not in it)."""
     item = ctx.repo.get_chat_item(user_id, chat_id)
@@ -95,37 +125,46 @@ def chat_item(ctx: RequestContext, user_id: UUID, chat_id: UUID) -> Optional[dic
 
 
 def announce_dm_open(ctx: RequestContext, chat: Chat, users: Iterable[UUID], replay: bool = True) -> None:
-    """event/chat dm_opened to both people, on every connection (the caller's too, so
-    no event about the room can reach a connection before it knows the room), then,
-    with `replay`, the request's stored first message as event/message. Call under
+    """chats/new to both people, on every connection (the caller's too, so no push
+    about the room can reach a connection before it knows the room), then, with
+    `replay`, the request's stored first message as chat/new_message. Call under
     the chat's lock."""
     users = list(users)
     for uid in users:
         item = chat_item(ctx, uid, chat.chat_id)
         if item is not None:
-            ctx.hub.push([uid], ReplyCord.event("chat", {"reason": "dm_opened", "chat": item}))
+            ctx.hub.push([uid], ReplyCord.push("chats/new", {"chat": item, "reason": "dm_opened"}))
     if replay:
         # The DM request's message was stored with the request; deliver it now.
         earlier, _ = ctx.repo.list_messages(chat.chat_id, MessageQuery(count=20))
         for msg in earlier:
-            ctx.hub.push(users, ReplyCord.event("message", {"chat_id": chat.chat_id, "chat_kind": chat.kind,
-                                                            "message": message_view(msg)}))
+            ctx.hub.push(users, ReplyCord.push("chat/new_message", {"chat_id": chat.chat_id,
+                                                                    "chat_kind": chat.kind,
+                                                                    "message": message_view(msg)}))
 
 
 def announce_pending(ctx: RequestContext, request: ChatRequest) -> None:
-    """event/request for a new DM request or invite, to its receiver: under the chat's
-    lock, and only if it is still pending, so it can never arrive after the newer
-    state (accepted, or the room already open) that an answer announced."""
+    """users/request for a new DM request or invite, to its receiver, plus chats/new
+    with a pending chat row for a group invitation: under the chat's lock, and only
+    if it is still pending, so they can never arrive after the newer state
+    (accepted, or the room already open) that an answer announced."""
     with ctx.app.chat_lock(request.chat_id):
         now = ctx.repo.get_request(request.request_id)
-        if now is not None and now.status == "pending":
-            ctx.hub.push([request.to_user], ReplyCord.event("request", {"request": request_view(now)}))
+        if now is None or now.status != "pending":
+            return
+        ctx.hub.push([request.to_user], ReplyCord.push("users/request", {"request": request_view(now)}))
+        if now.kind != "invite":
+            return      # a DM request has no room yet, so there is no chat row to send
+        chat = ctx.repo.get_chat(now.chat_id)
+        if chat is not None:
+            row = invited_chat_view(chat, now.created_at, len(ctx.repo.get_members(chat.chat_id)))
+            ctx.hub.push([request.to_user], ReplyCord.push("chats/new", {"chat": row}))
 
 
 def announce_request(ctx: RequestContext, request: ChatRequest, to: Optional[UUID]) -> None:
-    """event/request about a request's new status, to the other side."""
+    """users/request about a request's new status, to the other side."""
     if to is not None:
-        ctx.hub.push([to], ReplyCord.event("request", {"request": request_view(request)}),
+        ctx.hub.push([to], ReplyCord.push("users/request", {"request": request_view(request)}),
                      exclude_conn=ctx.peer.conn_id)
 
 
@@ -147,6 +186,12 @@ def answer_request(ctx: RequestContext, req: ChatRequest, status: str) -> Option
                 chat = ctx.repo.get_chat(req.chat_id)
                 if chat is not None:
                     after_join(ctx, chat, ctx.user)
+    if req.kind == "invite" and status in ("declined", "cancelled"):
+        # The invitee's pending chat row is gone: on this change the client drops it
+        # (their other devices too; the inviter hears about it as users/request).
+        ctx.hub.push([req.to_user], ReplyCord.push("chat/members_changed",
+                                                   {"chat_id": req.chat_id, "change": "invite_cancelled"}),
+                     exclude_conn=ctx.peer.conn_id)
     result = {"request": request_view(resolved)}
     if status == "accepted":
         result["chat"] = chat_item(ctx, me, req.chat_id)
@@ -180,9 +225,9 @@ def announce_membership(ctx: RequestContext, chat: Chat, who: UserRef, change: s
     member list: who joined or left, and the new member count. Call under the chat lock."""
     count = len(ctx.repo.get_members(chat.chat_id))
     if count == 0:
-        ctx.hub.push_all(ReplyCord.event("group_deleted", {"chat_id": chat.chat_id}))
+        ctx.hub.push_all(ReplyCord.push("chats/group_deleted", {"chat_id": chat.chat_id}))
         return
-    ctx.hub.push_all(ReplyCord.event("group_updated", {
+    ctx.hub.push_all(ReplyCord.push("chat/members_changed", {
         "chat_id": chat.chat_id, "name": chat.name, "member_count": count, "change": change,
         "user": user_ref(who)}))
 

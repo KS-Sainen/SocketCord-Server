@@ -399,7 +399,9 @@ class SocketCordServer:
             head = {"path": frame.url_hint.strip().strip("/")[:256],
                     "method": METHOD_NAMES.get(frame.method, str(frame.method))}
             if reply is not None:  # keep the context so the client can still match the reply
-                head.update({k: reply.data[k] for k in ("path", "method", "rid") if k in reply.data})
+                # Not its "path": the reply this replaces never went out, and an error
+                # does not claim the semantic name of a call that succeeded.
+                head.update({k: reply.data[k] for k in ("method", "rid") if k in reply.data})
             head.update(error="INTERNAL_ERROR", detail="unexpected server error")
             data = ReplyCord.from_dict(Status.INTERNAL_ERROR, head).pack()
         self._outq.put(("reply", peer.conn_id, data))

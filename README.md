@@ -8,7 +8,7 @@ stores everything in PostgreSQL. One feature reaches outside: the AI chat
 summary calls Anthropic's API over HTTPS with the official `anthropic` SDK
 (server to Anthropic only, never part of the client↔server protocol).
 
-* Wire format and challenge-response login: [docs/PROTOCOL.md](docs/PROTOCOL.md)
+* Wire format, password handling and sessions: [docs/PROTOCOL.md](docs/PROTOCOL.md)
 * Every call and push, in full: [docs/API.md](docs/API.md); a one-line list: [below](#calls)
 * Database: [below](#database), tables in [socketcord/db/schema.sql](socketcord/db/schema.sql)
 * AI summary (rubric Part 3): [below](#ai-chat-summary-part-3)
@@ -64,11 +64,11 @@ python3 -m pip install -r requirements-dev.txt
 python3 -m pytest
 ```
 
-The 262 tests use the in-memory database. About half of them start a real
+The 268 tests use the in-memory database. About half of them start a real
 server on a free port and talk to it over TCP; the rest check the
-repository, the wire format and the challenge-response math directly. To run the repository
-and server tests against PostgreSQL as well (474 tests in all), point
-`SOCKETCORD_TEST_DATABASE_URL` at an empty throwaway database. No test calls
+repository, the wire format and the password hashing directly. To run the
+repository and server tests against PostgreSQL as well (488 tests in all),
+point `SOCKETCORD_TEST_DATABASE_URL` at an empty throwaway database. No test calls
 the real AI API: the Claude tests run the real SDK against a local fake of
 the Messages API.
 
@@ -85,9 +85,9 @@ the last column).
 
 | Method | URL | What it does | API.md |
 | ------ | --- | ------------ | ------ |
-| POST | `users` | register (two-step challenge-response) | 2.1 |
-| POST | `users/login` | log in (two steps) | 2.2 |
-| PATCH | `users/profile` | change your username and/or name colours (`text_color`, `text_bg_color` or `background`) | 2.3 |
+| POST | `users` | register: `{username, password}` | 2.1 |
+| POST | `users/login` | log in: `{username, password}` | 2.2 |
+| PATCH | `users/profile` | change your username and/or name colours (`text_color`, `background`) | 2.3 |
 | GET | `users/info` | your account | 2.4 |
 | GET | `chats` | the chats you are in | 2.5 |
 | GET | `chat/{id}/info` | a chat's details and members | 2.6 |
@@ -95,7 +95,7 @@ the last column).
 | POST | `chat/{id}/message` | send a message | 2.8 |
 | POST | `users/{id}/dm` | send a DM; the first one opens the room (a request only with `DM_REQUIRE_ACCEPT=true`) | 2.9 |
 | POST | `chat/{id}/invite` | invite someone to a group | 2.10 |
-| PATCH | `users/profile/password` | change your password (two steps) | 2.11 |
+| PATCH | `users/password` | change your password: `{new_password}` (also under its older URL `users/profile/password`) | 2.11 |
 | POST | `users/logout` | end your session | 3.1 |
 | GET | `users/online` | who is online | 3.2 |
 | GET | `users/search` | find users by name | 3.3 |
@@ -139,9 +139,10 @@ the last column).
   one returns a `ReplyCord`, and the networking thread sends it back to the
   connection the request came from. Requests from one connection run in
   order, so replies come back in order.
-* **Pushes**: when something happens (new message, someone logs in, a DM
-  request), handlers ask the `PresenceHub` to send an `event/...` packet to
-  the right users' connections.
+* **Pushes**: when something happens (new message, someone logs in, an
+  invitation), handlers ask the `PresenceHub` to send a push packet
+  (`chat/new_message`, `users/status`, ... see docs/API.md section 4) to the
+  right users' connections.
 * **Errors never kill the server.** A bad packet, a crashing handler or a
   database outage becomes an error reply (250/254), and everyone else keeps
   chatting.
@@ -161,10 +162,10 @@ users ──1:N── messages ──N:1── chats ──┬── groups (Gro
 | ---- | ------ | ----- |
 | User ID | `users.user_id` | UUID |
 | Username | `users.username` | unique without regard to case (R3) |
-| Password Hash | `users.password_hash` | the SCRAM-SHA-256 verifier, in PostgreSQL's own format `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`; the password never reaches the server |
+| Password Hash | `users.password_hash` | a salted PBKDF2-HMAC-SHA256 hash (600,000 rounds, a fresh 16-byte salt per account), stored in PostgreSQL's own SCRAM format `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`. The password itself is never stored or logged — but it does travel to the server in clear text on an unencrypted socket (docs/PROTOCOL.md section 4). |
 | Session Token | `users.session_token_hash` | SHA-256 of the token (the token itself is never stored), one per account, plus `session_expires_at` |
 | User Text Color | `users.text_color` | `#rrggbb`, default `#171717` |
-| User Text Background Color | `users.text_bg_color` | `#rrggbb`, default `#f2f2f2` (the frontend's defaults) |
+| User Text Background Color | `users.text_bg_color` | `#rrggbb`, default `#f2f2f2` (the frontend's defaults); on the wire this colour is called `background` and is upper case |
 | Chat ID | `chats.chat_id` | `chats.kind` makes a chat exactly one of group / DM |
 | Group Name | `groups.group_name` | `groups.group_id` = `chats.chat_id` |
 | Group Membership | `group_memberships (user_id, group_id)` | the pair is the primary key; `status` `pending` = invited, `accepted` = member |
@@ -195,19 +196,19 @@ schema from before 2026-11-06 and says how to reset it.
 ```
 socketcord/
   protocol.py     RequestCord / ReplyCord, method + status codes, stream parsers
-  scram.py        challenge-response math + client flows (stdlib only; frontend can copy it)
+  scram.py        password hashing: PBKDF2 keys, the stored verifier format, verify_password
   server.py       the multi-connection socket server (networking thread)
   app.py          dispatch: frame → route → auth → handler → reply (+ path/rid context)
   router.py       URL patterns, ApiError, request field validation
   presence.py     online users, push to connections
-  security.py     challenge store, login throttling, session token hashing
+  security.py     rate limiters, login throttling, session token hashing
   ai.py           AI summaries: transcript, Claude engine, offline engine, cache and limits
   handlers/       auth.py (register/login/password/logout), users.py, chats.py, summary.py, common.py
   views.py        records → JSON
   config.py       environment variables
   db/             base.py (interface), postgres.py, memory.py, schema.sql
 client/socketcord_client.py   reference client + terminal UI
-tests/                        protocol, challenge-response, end-to-end
+tests/                        protocol, password hashing, contract v2, end-to-end
 Dockerfile, docker-compose.yml, .env.example
 ```
 
@@ -224,17 +225,15 @@ published).
 | -------- | ------- | ------- |
 | `SOCKETCORD_HOST` / `SOCKETCORD_PORT` | `0.0.0.0` / `8080` | where the server listens |
 | `DATABASE_URL` | `memory` | `memory` or `postgresql://...` (the password may also come from `PGPASSWORD`) |
-| `SOCKETCORD_SECRET` | random | keeps fake login challenges stable across restarts |
 | `SOCKETCORD_WORKERS` | `16` | handler threads |
 | `SOCKETCORD_MAX_CONNECTIONS` | `1024` | lowered automatically to what the file-descriptor limit allows |
 | `MAX_CONNECTIONS_PER_IP` | `64` (`512` in compose) | connections one address may hold |
 | `MAX_CONNECTIONS_PER_USER` | `5` | logged-in connections that may share an account's one session token; another connection's calls get `252 TOO_MANY_CONNECTIONS` |
-| `SCRAM_ITERATIONS` | `600000` | PBKDF2 rounds for new passwords; clients refuse fewer than 600,000 by default |
-| `SESSION_TTL_HOURS` | `168` | session lifetime, counted from the login (or from the last password change, which issues a new token) |
-| `CHALLENGE_TTL_SECONDS` | `60` | time to answer a challenge |
-| `LOGIN_MAX_FAILURES` / `LOGIN_FAILURE_WINDOW_SECONDS` | `5` / `300` | failed proofs per (username, address) per window |
-| `LOGIN_MAX_FAILURES_PER_CLIENT` | `50` | failed proofs per address for usernames that do not exist |
-| `CHALLENGE_RATE_PER_MINUTE` / `CHALLENGE_BURST` | `30` / `15` (`120` / `40` in compose) | register / password-change challenges per address (each costs a DH step) |
+| `SCRAM_ITERATIONS` | `600000` | PBKDF2-HMAC-SHA256 rounds for a new password hash (about 70 ms per login) |
+| `SESSION_TTL_HOURS` | `168` | session lifetime, counted from the login (a password change does not shorten or renew it) |
+| `LOGIN_MAX_FAILURES` / `LOGIN_FAILURE_WINDOW_SECONDS` | `5` / `300` | failed logins per (username, address) per window |
+| `LOGIN_MAX_FAILURES_PER_CLIENT` | `50` | failed logins per address for usernames that do not exist |
+| `REGISTER_RATE_PER_MINUTE` / `REGISTER_BURST` | `30` / `15` (`120` / `40` in compose) | `POST users` per address (each costs a PBKDF2 run) |
 | `GROUP_CREATE_PER_HOUR` | `20` | new groups per account (burst 5) |
 | `REQUEST_RATE_PER_HOUR` | `120` | DM requests + invites per account (burst 20) |
 | `MAX_PENDING_REQUESTS` | `100` | pending requests one user may have sent, or received (0 = no cap) |
@@ -268,9 +267,9 @@ published).
 | R1 | Listens on all interfaces; clients on other machines connect by IP. Docker for deployment. | – | – |
 | R2 | Raw `socket` + `selectors` only | `server.py` | `test_fragmented_and_coalesced_over_tcp` |
 | R3 | Usernames unique, case-insensitive (DB unique index) | `POST users` → `USERNAME_TAKEN` | `test_unique_names_case_insensitive` |
-| R4 | Online list includes yourself, plus live `event/presence` | `GET users/online` | `test_online_list_includes_self_and_updates` |
+| R4 | Online list includes yourself, plus live `users/status` pushes | `GET users/online` | `test_online_list_includes_self_and_updates` |
 | R5 | Every group and every DM pair is its own room (`chats` row; one DM per pair) | `GET chats` | `test_dm_request_accept_and_privacy` |
-| R6 | History plus live `event/message` for the chat window | `GET chat/{id}/messages`, `POST chat/{id}/message` | `test_group_lifecycle` |
+| R6 | History plus live `chat/new_message` for the chat window | `GET chat/{id}/messages`, `POST chat/{id}/message` | `test_group_lifecycle` |
 | R7 | DM to anyone in the list; only the two can read it | `POST users/{id}/dm` | `test_dm_request_accept_and_privacy` |
 | R8 | A new group has only its creator | `POST chats` | `test_group_lifecycle` |
 | R9 | All groups with member lists | `GET chats/groups` | `test_group_lifecycle` |
@@ -284,7 +283,7 @@ it first.
 
 Part 3, the AI feature: the **AI chat summary** (`GET chat/{id}/summary`,
 next section; tests in `tests/test_ai.py`). Beyond R1–R11 the backend also
-has the challenge-response login, the per-day registration limit, saved
+has the per-day registration limit, saved
 history in PostgreSQL, unread counts, message and user search, name colours,
 and Docker deployment. Every call and push, including the 17 calls that are
 not in the frontend README, is documented in [docs/API.md](docs/API.md).
@@ -347,9 +346,12 @@ Call details and error codes: [docs/API.md](docs/API.md), section 3.13.
 * **RequestCord** (application layer): our own framing on top of TCP.
   Size fields delimit packets in the stream, CRC-32 checks each field, and a
   method code + URL picks the call. JSON message bodies.
-* **SCRAM-SHA-256-style challenge-response** for passwords, since there is no
-  TLS underneath. An ephemeral **Diffie-Hellman** exchange (RFC 3526,
-  2048-bit) encrypts the password verifier at sign-up and at password change.
+* **No TLS.** Register, login and password change send the password in the
+  request body as clear text (wire contract v2), so anyone who can read the
+  traffic can read it. The server stores a salted **PBKDF2-HMAC-SHA256** hash
+  (600,000 rounds) and never the password. Wrapping the sockets in Python's
+  `ssl` module is what this design is missing; it is not implemented
+  (docs/PROTOCOL.md section 4).
 * **TCP options and flow control**: `TCP_NODELAY` is set because chat
   packets are small (Nagle's algorithm would delay them), and `SO_KEEPALIVE`
   notices dead peers. A client that floods requests is slowed down by TCP's
@@ -365,71 +367,65 @@ Call details and error codes: [docs/API.md](docs/API.md), section 3.13.
 
 ## Connecting the frontend
 
-What the frontend (checked at commit `b43be55`) still needs in order to talk
-to this server. [docs/API.md](docs/API.md) section 5 maps every reply onto
-the data-in methods of `chat_page.py` and lists the client's duties.
+What the frontend needs in order to talk to this server, under wire contract
+v2. [docs/API.md](docs/API.md) section 5 maps every reply onto the data-in
+methods of `chat_page.py` and lists the client's duties.
 
-1. **Log in and sign up with the challenge-response flows.** `main.py` sends
-   `{"username", "password"}` in the clear, which the server refuses with
-   `250 PLAINTEXT_PASSWORD`. Copy `socketcord/scram.py` next to `models.py`
-   and do:
-
-   ```python
-   from scram import LoginFlow
-   self.flow = LoginFlow(username, password)
-   self.network.send(RequestCord.from_dict(POST_MTDC, "users/login", self.flow.start()))
-   # in handle_reply, when path == "users/login" and status == 200:
-   if data["step"] == "challenge":
-       self.network.send(RequestCord.from_dict(POST_MTDC, "users/login", self.flow.respond(data)))
-   elif data["step"] == "done" and self.flow.verify(data):
-       RequestCord.set_auth(data["user_id"], data["session_token"])
-   ```
-
-   Sign-up is `RegisterFlow` with URL `users` (`do_signup` sends to
-   `users/login` for now). `ChangePasswordFlow` (URL
-   `users/profile/password`, method PATCH) works the same way, and its final
-   reply carries a new `session_token`: call `RequestCord.set_auth` with it
-   at once. Each flow takes about 70–170 ms of PBKDF2 on the client, so a
-   worker thread is nicer than the UI thread. A flow object is single-use:
-   after any failure (wrong password, expired challenge) make a new one.
-   Password-change failures answer 252, not 251, so do not log the user out
-   on those.
-2. **Route replies on `path` and `method`.** Replies carry `path` = the
-   request URL (`users/login`, `users`, `chats`, ...) and `method`; pushes
-   use `event/...`. `main.py` calls `.to_lower()`, which Python strings do
-   not have (use `.lower()`), and checks for a first segment `login`, which
-   never comes: the login replies say `users/login`.
-3. **Show the chat page.** `main.py` still has `ChatPage` commented out. Feed
-   it as described in docs/API.md section 5. Convert the API's timestamps
-   first: `chat_page.py` parses them with `datetime.fromisoformat`, which
-   does not accept the trailing `Z` before Python 3.11.
-4. **Handle being logged out.** A `251` reply to a call sent with
-   credentials (every call except `POST users` and `POST users/login`), or an
-   `event/session_revoked` push, means the connection is no longer logged
-   in: clear the credentials and show the login page. On sign-up and login,
-   `251` only means that attempt failed (wrong password, expired challenge):
-   show the error. One session per account: a login on another device ends
-   this one (`logged_in_elsewhere`), so never log in again automatically.
-5. **DMs and invites.** By default (`DM_REQUIRE_ACCEPT=false`) a first DM
-   opens the room at once. An invite waits to be accepted: answer it with
-   `POST chat/{id}/invite/accept` or `.../invite/reject`, and keep the list
-   current with `GET users/requests` and `event/request`.
+1. **Sign up and log in with one request each.** `POST users` and
+   `POST users/login` take `{"username", "password"}` — the password in the
+   message body, which is what the GUI already sends. The login reply has
+   `user_id`, `session_token`, `username`, `text_color` and `background`;
+   put the first two in every later request header
+   (`RequestCord.set_auth`). `PATCH users/password` with `{"new_password"}`
+   changes the password, keeps the session token, and needs no current
+   password. There is no `scram.py` to copy any more, and no `step` field in
+   any reply.
+2. **Route replies on `path` and `method`.** `path` is now the name of the
+   call, not the URL: `login/created`, `login/success`, `profile/info`,
+   `chats/list`, `chat/messages`, ... (the table at the top of docs/API.md).
+   An error reply carries the request URL instead, so a login error arrives
+   with `users/login`, never `login/success`; match replies by `rid`. A packet
+   with no `method` and no `rid` is a push, and its `path` is one of the nine
+   in docs/API.md section 4.
+3. **Show the chat page.** Feed it as described in docs/API.md section 5. A
+   message is `{"id", "sender_id", "sender", "text", "time"}` and a user's
+   colours are `text_color` and `background`, in upper case, so most of the
+   old adapter work is gone. Timestamps end in `+00:00`, which
+   `datetime.fromisoformat` reads on every Python version this project
+   supports.
+4. **Handle being logged out.** A `251` reply to a call sent with credentials
+   (every call except `POST users` and `POST users/login`), or a
+   `login/revoked` push, means the connection is no longer logged in: clear
+   the credentials and show the login page. On sign-up and login, `251` only
+   means that attempt failed (wrong username or password): show the error.
+   One session per account: a login on another device ends this one
+   (`logged_in_elsewhere`), so never log in again automatically.
+5. **DMs and invitations.** By default (`DM_REQUIRE_ACCEPT=false`) a first DM
+   opens the room at once and both sides get `chats/new`. A group invitation
+   arrives as `chats/new` with `pending: true` and is also a `pending` row of
+   `GET chats`, so it survives a reconnect; answer it with
+   `POST chat/{id}/invite/accept` or `.../invite/reject`, and drop the row on
+   `chat/members_changed` with `change` `"invite_cancelled"`.
 6. **Send read markers.** `POST chat/{id}/read` after showing a chat;
    otherwise unread counts and the NEW line never clear.
 7. **Wait longer for the AI summary.** `GET chat/{id}/summary` takes a few
    seconds, at worst about a minute: use a 90 s reply timeout (docs/API.md
    section 3.13).
-8. `login_page.py` shows "Signing up..." when LOG IN is clicked and
-   "Logging in..." for SIGN UP.
 
 ## Known limits
 
-* No TLS: chat text and session tokens are readable on the wire, and someone
-  who can modify traffic during sign-up could swap the DH value (see the
-  table in docs/PROTOCOL.md §4). Passwords and verifiers never are.
-* Challenges, login throttling and presence live in memory, which is right
-  for one server process. Running several backend processes would need them
-  moved into a shared store.
+* **No TLS, and the password travels in clear text.** Register, login and
+  password change put the password in the request body on an unencrypted
+  socket (wire contract v2), so anyone who can read the traffic can read it
+  and log in as that user; chat text and session tokens are readable the same
+  way, and nothing stops a man in the middle from changing a request. What
+  the server keeps is a salted PBKDF2-HMAC-SHA256 hash, so a database dump
+  holds no passwords. The table in docs/PROTOCOL.md section 4 lists exactly
+  what is and is not protected. This is not a secure design; it is the one
+  the team chose for the deadline.
+* Login throttling and presence live in memory, which is right for one server
+  process. Running several backend processes would need them moved into a
+  shared store.
 * Requests from one connection run in order, so while a summary is being
   written, that connection's next requests wait (pushes still arrive). Give
   `GET chat/{id}/summary` a long reply timeout (the reference client waits
@@ -437,7 +433,7 @@ the data-in methods of `chat_page.py` and lists the client's duties.
   and send the summary there with the same User ID and Session Token in the
   header. Never call `users/login` on that second connection: an account
   has one session, so a login there would end the first connection's
-  session (`event/session_revoked`, reason `logged_in_elsewhere`).
+  session (`login/revoked`, reason `logged_in_elsewhere`).
 * One session per account: logging in on a second device logs the first one
   out. Several connections can still share the session (up to
   `MAX_CONNECTIONS_PER_USER`), as described above.

@@ -13,13 +13,13 @@ def test_dm_requester_does_not_see_their_own_first_message_as_unread(make_server
     rid = a.post(f"users/{b.user_id}/dm", {"message": "first, from a"})["request"]["request_id"]
     b.post(f"users/requests/{rid}/accept")
     page = a.get(f"chat/{rid}/messages")
-    assert page["first_unread_message_id"] is None
-    assert page["last_read_message_id"] == page["messages"][0]["message_id"]
+    assert page["first_unread_id"] is None
+    assert page["last_read_message_id"] == page["messages"][0]["id"]
     item = next(c for c in a.get("chats")["chats"] if c["chat_id"] == rid)
     assert item["unread"] == 0
     assert a.summary(rid, mode="unread")["message_count"] == 0       # nothing unread to summarize
     b_page = b.get(f"chat/{rid}/messages")                            # for b it is new
-    assert b_page["first_unread_message_id"] == page["messages"][0]["message_id"]
+    assert b_page["first_unread_id"] == page["messages"][0]["id"]
 
 
 def test_time_filters_at_the_edges_of_the_calendar_are_bad_requests(server):
@@ -55,8 +55,8 @@ def test_read_marker_always_lands_on_a_message_of_that_chat(server):
     a = server.user("marker")
     g1 = a.post("chats", {"name": "one"})["chat"]["chat_id"]
     g2 = a.post("chats", {"name": "two"})["chat"]["chat_id"]
-    m1 = a.post(f"chat/{g1}/message", {"content": "in one"})["message"]["message_id"]
-    other = a.post(f"chat/{g2}/message", {"content": "in two"})["message"]["message_id"]
+    m1 = a.post(f"chat/{g1}/message", {"content": "in one"})["message"]["id"]
+    other = a.post(f"chat/{g2}/message", {"content": "in two"})["message"]["id"]
     # An id from another chat, or a random v4 id, never becomes this chat's marker.
     assert a.post(f"chat/{g1}/read", {"message_id": other})["last_read_message_id"] == m1
     assert a.post(f"chat/{g1}/read", {"message_id": str(uuid.uuid4())})["last_read_message_id"] in (m1,)

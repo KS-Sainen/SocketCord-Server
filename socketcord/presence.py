@@ -8,7 +8,7 @@ logs out, or the session is revoked or expires.
 
 * Presence changes are pushed while holding the lock, so the networking
   thread (which sends queued packets in order) never delivers "online" after
-  the matching "offline". Each event/presence carries an increasing `seq`.
+  the matching "offline". Each users/status push carries an increasing `seq`.
 * When the last connection of a user closes, "offline" waits a short grace
   period (LINGER_SECONDS) and is cancelled if the user reconnects, so a client
   that reconnects quickly, or someone flapping on purpose, does not make every
@@ -50,8 +50,10 @@ class OnlineUser:
     text_bg_color: str = DEFAULT_TEXT_BG_COLOR
 
     def as_dict(self, online: bool) -> dict:
-        return {"user_id": self.user_id, "username": self.username, "text_color": self.text_color,
-                "text_bg_color": self.text_bg_color, "online": online}
+        # Upper case on the wire (contract v2 section 3); views.color() does the
+        # same, but importing views here would be a cycle.
+        return {"user_id": self.user_id, "username": self.username, "text_color": self.text_color.upper(),
+                "background": self.text_bg_color.upper(), "online": online}
 
 
 @dataclass
@@ -93,7 +95,6 @@ class PresenceHub:
         with self._lock:
             self._send, self._close = _noop_send, _noop_close
 
-    # ------------------------------------------------------------------ connection lifecycle
     def connection_opened(self, conn_id: int) -> None:
         with self._lock:
             self._open.add(conn_id)
@@ -108,7 +109,6 @@ class PresenceHub:
         with self._lock:
             return conn_id in self._open
 
-    # ------------------------------------------------------------------ binding
     def bind(self, conn_id: int, user: OnlineUser, session_hash: Optional[bytes],
              expires_at: Optional[datetime] = None, allow_switch: bool = False,
              max_per_user: int = 0, evict_oldest: bool = False, replacing: Optional[bytes] = None) -> str:
@@ -143,7 +143,7 @@ class PresenceHub:
                 if not evict_oldest:
                     return REFUSED_LIMIT
                 oldest = min(counted, key=lambda cid: self._bindings[cid].since)
-                self._send(oldest, ReplyCord.event("session_revoked", {"reason": "too_many_connections"}).pack())
+                self._send(oldest, ReplyCord.push("login/revoked", {"reason": "too_many_connections"}).pack())
                 self._unbind_locked(oldest, linger=False)
                 conns = self._user_conns.get(user.user_id, set())
             self._bindings[conn_id] = _Binding(user.user_id, session_hash, expires_at, time.monotonic())
@@ -241,7 +241,7 @@ class PresenceHub:
         with self._lock:
             expired = [cid for cid, b in self._bindings.items() if b.expires_at is not None and b.expires_at <= now]
             if expired:
-                data = ReplyCord.event("session_revoked", {"reason": "expired"}).pack()
+                data = ReplyCord.push("login/revoked", {"reason": "expired"}).pack()
                 for cid in expired:
                     self._send(cid, data)
                     self._unbind_locked(cid, linger=False)
@@ -281,7 +281,8 @@ class PresenceHub:
 
     def _push_presence_locked(self, who: OnlineUser, online: bool, exclude_conn: Optional[int] = None) -> None:
         self._seq += 1
-        event = ReplyCord.event("presence", {"user": who.as_dict(online), "online": online, "seq": self._seq})
+        event = ReplyCord.push("users/status", {"user_id": who.user_id, "online": online,
+                                               "user": who.as_dict(online), "seq": self._seq})
         data = event.pack()
         for cid in self._bindings:
             if cid != exclude_conn:
@@ -292,7 +293,6 @@ class PresenceHub:
             if user.user_id in self._profiles:
                 self._profiles[user.user_id] = user
 
-    # ------------------------------------------------------------------ queries
     def user_of(self, conn_id: int) -> Optional[UUID]:
         with self._lock:
             b = self._bindings.get(conn_id)
@@ -306,8 +306,8 @@ class PresenceHub:
         return self.online_snapshot()[0]
 
     def online_snapshot(self) -> Tuple[List[OnlineUser], int]:
-        """(online users, presence seq at that moment): a client can ignore
-        event/presence whose seq is not newer than the snapshot's."""
+        """(online users, presence seq at that moment): a client can ignore a
+        users/status push whose seq is not newer than the snapshot's."""
         with self._lock:
             users = [self._profiles[uid] for uid in (set(self._user_conns) | set(self._lingering))
                      if uid in self._profiles]
@@ -317,7 +317,6 @@ class PresenceHub:
         with self._lock:
             return set(self._user_conns.get(user_id, ()))
 
-    # ------------------------------------------------------------------ pushing
     def push(self, user_ids: Iterable[UUID], reply: ReplyCord, exclude_conn: Optional[int] = None) -> int:
         """Sends `reply` to every live connection of the given users. Returns how many got it."""
         data = reply.pack()                       # pack outside the lock

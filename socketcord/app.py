@@ -20,7 +20,7 @@ from .presence import PresenceHub
 from .protocol import MAX_MESSAGE_BYTES, METHOD_NAMES, Frame, MessageError, ReplyCord, Status, peek_rid, valid_rid
 from .router import (ApiError, RequestContext, Router, bad_request, forbidden, not_found, normalize_url,
                      unauthorized)
-from .security import ChallengeStore, LoginGuard, RateLimiter, ServerDHKey, token_hash
+from .security import LoginGuard, RateLimiter, token_hash
 from .views import online_user
 
 log = logging.getLogger("socketcord.app")
@@ -45,12 +45,10 @@ class Application:
         self.repo = repo
         self.router = router
         self.hub = PresenceHub()
-        self.challenges = ChallengeStore(config.challenge_ttl, is_open=self.hub.is_open)
         self.login_guard = LoginGuard(config.login_max_failures, config.login_failure_window,
                                       config.login_max_failures_per_client)
-        self.dh_key = ServerDHKey()
-        # Per client address: challenges that cost the server a DH step.
-        self.challenge_limiter = RateLimiter(config.challenge_rate_per_minute, config.challenge_burst)
+        # Per client address: registering costs a PBKDF2 run before anything is stored.
+        self.register_limiter = RateLimiter(config.register_rate_per_minute, config.register_burst)
         # Per account: actions that push packets to other people, or fill the database.
         self.group_limiter = RateLimiter(config.group_create_per_hour / 60.0, burst=5)
         self.request_limiter = RateLimiter(config.request_rate_per_hour / 60.0, burst=20)
@@ -74,7 +72,6 @@ class Application:
     def pair_lock(self, user_a: UUID, user_b: UUID) -> threading.RLock:
         return self._pair_locks[hash(frozenset((user_a, user_b))) % CHAT_LOCK_STRIPES]
 
-    # ------------------------------------------------------------------ server hooks
     # These run on the networking thread, so they must never touch the database.
     def attach(self, server) -> None:
         self.hub.attach(server.send, server.close_connection)
@@ -86,33 +83,30 @@ class Application:
         self.hub.connection_opened(peer.conn_id)
 
     def on_disconnect(self, peer) -> None:
-        self.challenges.drop_connection(peer.conn_id)
         self.hub.connection_closed(peer.conn_id)
 
     def tick(self) -> None:
         self.hub.tick(time.monotonic())
 
     def housekeeping(self) -> None:
-        self.challenges.purge_expired()
         self.login_guard.purge()
         self.hub.expire_sessions(datetime.now(timezone.utc))
 
     def is_authenticated(self, conn_id: int) -> bool:
         return self.hub.user_of(conn_id) is not None
 
-    # ------------------------------------------------------------------ presence
     def bind_presence(self, conn_id: int, user: User, session: Session, login: bool = False,
                       replacing: Optional[bytes] = None) -> str:
         return self.hub.bind(conn_id, online_user(user), session.token_hash, session.expires_at,
                              allow_switch=login, max_per_user=self.config.max_connections_per_user,
                              evict_oldest=login, replacing=replacing)
 
-    # ------------------------------------------------------------------ dispatch
     def dispatch(self, peer, frame: Frame) -> ReplyCord:
         started = time.perf_counter()
         path = normalize_url(frame.url_hint)
         method = frame.request.method_name if frame.request else METHOD_NAMES.get(frame.method, str(frame.method))
         rid = None
+        reply_path = None
         try:
             if frame.error:
                 raise bad_request(frame.error, frame.detail)
@@ -132,6 +126,7 @@ class Application:
             if matched is None:
                 raise not_found("NOT_FOUND", f"no such call ({method})")
             route, params = matched
+            reply_path = route.path
             ctx = RequestContext(app=self, peer=peer, request=req, body=body)
             if route.auth:
                 self._authenticate(ctx)
@@ -148,9 +143,15 @@ class Application:
             log.exception("handler error for %s %s from %s", loggable(method, 20), loggable(path), peer)
             reply = ApiError(Status.INTERNAL_ERROR, "INTERNAL_ERROR", "unexpected server error").reply()
 
-        # Context for the client: which call this reply answers. GET chats and POST
-        # chats share a path, so the method is echoed too.
-        head = {"path": path[:PATH_ECHO_LIMIT], "method": method[:16]}
+        # Context for the client: which call this reply answers. `path` is the
+        # route's semantic name (contract v2 section 2) and falls back to the
+        # request URL for a route the contract does not name; GET chats and POST
+        # chats share a path, so the method is echoed too. An error is never
+        # given the semantic name, which is the name of the call SUCCEEDING: it
+        # echoes the request URL, so a wrong password is not "login/success".
+        if not reply.ok:
+            reply_path = None
+        head = {"path": reply_path or path[:PATH_ECHO_LIMIT], "method": method[:16]}
         if rid is not None:
             head["rid"] = rid
         head.update({k: v for k, v in reply.data.items() if k not in ("path", "method", "rid")})
@@ -182,7 +183,7 @@ class Application:
         if session.expires_at <= datetime.now(timezone.utc):
             # A dead session: make sure no connection keeps getting pushes on it.
             self.hub.revoke_sessions([session.token_hash],
-                                     notify=ReplyCord.event("session_revoked", {"reason": "expired"}))
+                                     notify=ReplyCord.push("login/revoked", {"reason": "expired"}))
             raise unauthorized("INVALID_SESSION", "the session is invalid or expired; log in again")
         ctx.user, ctx.session = user, session
         # Any authenticated request marks this connection as online for the user,

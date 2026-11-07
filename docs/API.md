@@ -3,58 +3,66 @@
 Every call the backend serves and every packet it pushes: request fields, reply fields, limits,
 defaults, errors, pushes, and an example of each. It is written from the code
 (`socketcord/handlers/`, `socketcord/views.py`, `socketcord/router.py`, `socketcord/app.py`,
-`socketcord/presence.py`), and the examples are real replies captured from a running server
-(long base64 values are shortened, and the PBKDF2 iteration count is shown at its default).
-The order of keys inside a JSON object means nothing, and the examples do not always show the
-server's order: the push examples list `path` first, while the server sends it last.
+`socketcord/presence.py`). The order of keys inside a JSON object means nothing, and the
+examples do not always show the server's order: they list `path` first, while the server sends
+it last.
+
+This is **wire contract v2**: register, log in and change your password each take ONE request,
+with the password in the message body as **clear text**. The socket is a plain TCP socket with
+no TLS, so anyone who can watch the traffic between the client and the server can read the
+password. The server hashes it with PBKDF2-HMAC-SHA256 (600,000 rounds, a 16-byte random salt
+per account) and stores only that hash; it never stores or logs the password itself, and no
+reply ever contains it. This is not a secure design, and it is not presented as one.
 
 The frontend README lists 11 calls (section 2). The backend serves 17 more (section 3), and
-answers the summary by POST as well as GET; the team rule says those must be documented in full,
-and they are. The binary packet layout, the
-challenge-response math and the connection limits are in [PROTOCOL.md](PROTOCOL.md); the
-database is described in the [README](../README.md#database).
+answers the summary by POST as well as GET; the team rule says those must be documented in
+full, and they are. The binary packet layout, the password hashing and the connection limits
+are in [PROTOCOL.md](PROTOCOL.md); the database is described in the
+[README](../README.md#database).
 
 | Section | Contents |
 | ------- | -------- |
 | [1. Conventions](#1-conventions) | requests, reply head, authentication, ids and time, common errors, text rules, rate limits, object shapes |
 | [2. The 11 calls of the frontend README](#2-the-11-calls-of-the-frontend-readme) | register, login, profile, info, chats, chat info, messages, send, DM, invite, password |
 | [3. Additional calls](#3-additional-calls) | logout, online, search, requests, accept/decline/cancel, create group, all groups, read, join, leave, AI summary, a user's groups, invitees, accept/reject an invite by group |
-| [4. Server pushes](#4-server-pushes) | `event/message`, `presence`, `request`, `chat`, `group_created`, `group_updated`, `group_deleted`, `profile`, `session_revoked` |
+| [4. Server pushes](#4-server-pushes) | `chat/new_message`, `users/status`, `users/request`, `chats/new`, `chats/group_created`, `chat/members_changed`, `chats/group_deleted`, `users/profile_changed`, `login/revoked` |
 | [5. Frontend adapter](#5-frontend-adapter) | API objects to `chat_page.py`, and what the client must do |
 
-All calls:
+All calls. `path` is what a successful reply to that call carries in its head (section 1.2);
+a URL the contract v2 table does not name, and every error, answers with the URL itself.
 
-| Method | URL | Auth | What it does | Section |
-| ------ | --- | ---- | ------------ | ------- |
-| POST | `users` | none | register (two steps) | 2.1 |
-| POST | `users/login` | none | log in (two steps) | 2.2 |
-| PATCH | `users/profile` | yes | change your username and/or name colours | 2.3 |
-| GET | `users/info` | yes | your account | 2.4 |
-| GET | `chats` | yes | the chats you are in | 2.5 |
-| GET | `chat/{chat_id}/info` | yes | a chat's details and members | 2.6 |
-| GET | `chat/{chat_id}/messages` | member | message history, with filters | 2.7 |
-| POST | `chat/{chat_id}/message` | member | send a message | 2.8 |
-| POST | `users/{user_id}/dm` | yes | send a DM (the first one opens the room; a request only with `DM_REQUIRE_ACCEPT=true`) | 2.9 |
-| POST | `chat/{chat_id}/invite` | member | invite someone to a group | 2.10 |
-| PATCH | `users/profile/password` | yes | change your password (two steps) | 2.11 |
-| POST | `users/logout` | yes | end your session | 3.1 |
-| GET | `users/online` | yes | who is online | 3.2 |
-| GET | `users/search` | yes | find users by name | 3.3 |
-| GET | `users/requests` | yes | your pending DM requests and invites | 3.4 |
-| POST | `users/requests/{request_id}/accept` | receiver | accept a DM request or invite | 3.5 |
-| POST | `users/requests/{request_id}/decline` | receiver | decline one | 3.6 |
-| POST | `users/requests/{request_id}/cancel` | sender | take one back | 3.7 |
-| POST | `chats` | yes | create a group | 3.8 |
-| GET | `chats/groups` | yes | every group on the server | 3.9 |
-| POST | `chat/{chat_id}/read` | member | move your read marker | 3.10 |
-| POST | `chat/{chat_id}/join` | yes | join a group by yourself | 3.11 |
-| POST | `chat/{chat_id}/leave` | member | leave a group | 3.12 |
-| GET | `chat/{chat_id}/summary` | member | AI summary of a chat | 3.13 |
-| POST | `chat/{chat_id}/summary` | member | the same call by POST (the frontend README's method) | 3.13 |
-| GET | `users/{user_id}/groups` | yes | the groups a user is in | 3.14 |
-| GET | `chat/{chat_id}/invitees` | member | who you can invite to a group | 3.15 |
-| POST | `chat/{chat_id}/invite/accept` | invitee | accept your invite to that group | 3.16 |
-| POST | `chat/{chat_id}/invite/reject` | invitee | decline your invite to that group | 3.17 |
+| Method | URL | Auth | `path` | What it does | Section |
+| ------ | --- | ---- | ------ | ------------ | ------- |
+| POST | `users` | none | `login/created` | register | 2.1 |
+| POST | `users/login` | none | `login/success` | log in | 2.2 |
+| PATCH | `users/profile` | yes | `profile/updated` | change your username and/or name colours | 2.3 |
+| GET | `users/info` | yes | `profile/info` | your account | 2.4 |
+| GET | `chats` | yes | `chats/list` | the chats you are in, and invitations | 2.5 |
+| GET | `chat/{chat_id}/info` | yes | `chat/info` | a chat's details and members | 2.6 |
+| GET | `chat/{chat_id}/messages` | member | `chat/messages` | message history, with filters | 2.7 |
+| POST | `chat/{chat_id}/message` | member | `chat/sent` | send a message | 2.8 |
+| POST | `users/{user_id}/dm` | yes | `chats/dm` | send a DM (the first one opens the room; a request only with `DM_REQUIRE_ACCEPT=true`) | 2.9 |
+| POST | `chat/{chat_id}/invite` | member | `chat/invited` | invite someone to a group | 2.10 |
+| PATCH | `users/password` | yes | `profile/password` | change your password | 2.11 |
+| PATCH | `users/profile/password` | yes | `profile/password` | the same call under its older URL | 2.11 |
+| POST | `users/logout` | yes | `login/logout` | end your session | 3.1 |
+| GET | `users/online` | yes | `users/online` | who is online | 3.2 |
+| GET | `users/search` | yes | the URL | find users by name | 3.3 |
+| GET | `users/requests` | yes | the URL | your pending DM requests and invites | 3.4 |
+| POST | `users/requests/{request_id}/accept` | receiver | the URL | accept a DM request or invite | 3.5 |
+| POST | `users/requests/{request_id}/decline` | receiver | the URL | decline one | 3.6 |
+| POST | `users/requests/{request_id}/cancel` | sender | the URL | take one back | 3.7 |
+| POST | `chats` | yes | `chats/created` | create a group | 3.8 |
+| GET | `chats/groups` | yes | the URL | every group on the server | 3.9 |
+| POST | `chat/{chat_id}/read` | member | `chat/read` | move your read marker | 3.10 |
+| POST | `chat/{chat_id}/join` | yes | the URL | join a group by yourself | 3.11 |
+| POST | `chat/{chat_id}/leave` | member | the URL | leave a group | 3.12 |
+| GET | `chat/{chat_id}/summary` | member | `chat/summary` | AI summary of a chat | 3.13 |
+| POST | `chat/{chat_id}/summary` | member | `chat/summary` | the same call by POST (the frontend README's method) | 3.13 |
+| GET | `users/{user_id}/groups` | yes | `users/groups` | the groups a user is in | 3.14 |
+| GET | `chat/{chat_id}/invitees` | member | the URL | who you can invite to a group | 3.15 |
+| POST | `chat/{chat_id}/invite/accept` | invitee | `chat/joined` | accept your invite to that group | 3.16 |
+| POST | `chat/{chat_id}/invite/reject` | invitee | `chat/declined` | decline your invite to that group | 3.17 |
 
 ---
 
@@ -85,9 +93,12 @@ User ID and Session Token (16 raw bytes each, all zeros when logged out), the UR
   `1e400`, a string with a NUL character or a lone surrogate) makes the whole message invalid:
   the call does not run, and the reply is `250 INVALID_JSON` without `rid`.
 * Fields a call does not list are ignored. A field that is absent and a field that is `null` mean
-  the same thing: "not given". The exception is `password`, `old_password` and `new_password` in
-  the register, login and password-change calls: if the key is there at all, even as `null`, the
-  request is refused with `250 PLAINTEXT_PASSWORD`.
+  the same thing: "not given".
+* Some fields have two accepted spellings, because the reply's word and the frontend's older
+  word differ: `text`/`content` (the message body and the history filter), `background`/
+  `text_bg_color`, `message`/`text`/`content` (a DM body) and `message_id`/`id` (the read
+  marker). The first spelling is the one the reply uses; if both are sent, the first one wins
+  (the colours are the exception: two different colours are refused).
 
 ### 1.2 Replies
 
@@ -96,7 +107,7 @@ A reply is one ReplyCord packet: a status code and a JSON object. Its first fiel
 
 | Field | Type | Present | Meaning |
 | ----- | ---- | ------- | ------- |
-| `path` | string | always | The request URL without leading/trailing `/`, first 256 characters. |
+| `path` | string | always | The **semantic name of the call**, such as `login/success` or `chat/messages` (the table at the top of this file, and contract v2 section 2). A call the contract does not name answers with the request URL instead, without leading/trailing `/` and cut to 256 characters; so do replies to a URL no route matched, **and every reply whose status is not 200**: the semantic name names the call succeeding, so an error echoes the URL (a wrong password answers `users/login`, never `login/success`). |
 | `method` | string | always (not in pushes) | `"POST"`, `"GET"` or `"PATCH"`, also when the packet itself was broken (a checksum or UTF-8 error). For an unknown method code, the code in decimal, such as `"12345"`. |
 | `rid` | integer or string | when the request had a valid one | The request's own `rid`. |
 | `error` | string | status ≠ 200 | Machine-readable code (sections 1.5 and [PROTOCOL.md](PROTOCOL.md) section 3). |
@@ -108,15 +119,17 @@ The call's own fields follow the head. Every field a call lists is always presen
 call says otherwise; "none" is sent as `null`, not left out.
 
 Requests from one connection are answered one at a time, in the order they were sent. Server
-pushes (section 4) can arrive between replies: they have `path` = `event/<name>` and no `method`
-or `rid`. Route a packet by `path` and `method` (`GET chats` and `POST chats` share the path
-`chats`), or by `rid`.
+pushes (section 4) can arrive between replies: a push has one of the nine paths in section 4
+and **no `method` and no `rid`**, so `"method" not in reply` is the test for "this is a push"
+(`socketcord/protocol.py` has the list as `PUSH_PATHS`; no push path is ever a request URL).
+Route a reply by its `rid`, or by `path` and `method` (`GET chats` is `chats/list` and `POST
+chats` is `chats/created`, so the paths of the named calls are already unique).
 
-Error replies look like this:
+Error replies look like this (`path` is the URL that was asked for):
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/messages",
+  "path": "chat/4f1e.../messages",
   "method": "GET",
   "rid": 7,
   "error": "NOT_A_MEMBER",
@@ -126,12 +139,12 @@ Error replies look like this:
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/message",
+  "path": "chat/4f1e.../message",
   "method": "POST",
   "rid": 14,
   "error": "INVALID_FIELD",
-  "detail": "'content' cannot be blank",
-  "field": "content"
+  "detail": "'text' cannot be blank",
+  "field": "text"
 }
 ```
 
@@ -150,20 +163,20 @@ in the request header.
 
 * A `251` reply to a call sent with credentials (every call except `POST users` and
   `POST users/login`) means "the session is gone, show the login page". On `POST users` and
-  `POST users/login`, `251` only reports that this attempt failed (wrong password, expired
-  challenge, a login that lost a race with another login of the account): show the error and let
-  the user try again. The password change answers its own failures (wrong current password,
-  expired challenge) with `252`, because the session is still fine.
+  `POST users/login`, `251` only reports that this attempt failed (wrong username or password,
+  or a login that lost a race with another login of the same account): show the error and let
+  the user try again.
 * The URL is matched before the credentials are checked: an unknown call answers
   `253 NOT_FOUND` "no such call (...)" with or without credentials.
 * The first authenticated request on a connection logs that connection in. A client that
   reconnects with a saved token is therefore online again, and if the account was offline,
-  everyone else gets `event/presence`.
+  everyone else gets `users/status`.
 * **One session per account.** A login ends the previous session everywhere
-  (`event/session_revoked`, reason `logged_in_elsewhere`), and a password change replaces the
-  token (the new one is in its reply). Several connections may share the one token: send the same
-  User ID and Session Token on each of them, and never call `users/login` on the extra ones.
-  Details: [PROTOCOL.md](PROTOCOL.md) section 4, "Sessions".
+  (`login/revoked`, reason `logged_in_elsewhere`). A password change does NOT: it keeps the
+  token, so the caller and its other connections keep working (section 2.11). Several
+  connections may share the one token: send the same User ID and Session Token on each of them,
+  and never call `users/login` on the extra ones. Details:
+  [PROTOCOL.md](PROTOCOL.md) section 4, "Sessions".
 
 ### 1.4 Ids and timestamps
 
@@ -171,19 +184,19 @@ in the request header.
   case with hyphens. Fields that take an id accept any form `uuid.UUID` reads.
 * A DM request's `request_id` is the DM's `chat_id`. An invite's `request_id` is its membership
   id, which is not a chat id.
-* `message_id` is a **UUIDv7** made by the server. Its first 48 bits are the Unix time in
+* A message's `id` is a **UUIDv7** made by the server. Its first 48 bits are the Unix time in
   milliseconds, followed by a counter, so a later message always has a larger id, and within one
   chat ids become visible in that order (paging with `after_id` never skips a message). Since the
   server sends every id in lower case with the hyphens in the same places, comparing two message
   ids as strings gives the same order as comparing their times: `a < b` means `a` is older.
   `uuid.UUID(a) < uuid.UUID(b)` gives the same answer.
-* Read markers (`last_read_message_id`) are message ids, or `null` when nothing has been read.
-* **Timestamps in replies** are ISO 8601 in UTC with milliseconds and a `Z`, such as
-  `"2026-11-06T14:11:01.092Z"`. A message's `created_at` is the time stored inside its id.
-  * Python 3.11 and later: `datetime.fromisoformat(s)`.
-  * Python 3.9 and 3.10, whose `fromisoformat` does not accept `Z`:
-    `datetime.fromisoformat(s.replace("Z", "+00:00"))`.
-  * Both give an aware UTC `datetime`; `.astimezone()` converts it to local time for display.
+* Read markers (`last_read_message_id`, `first_unread_id`) are message ids, or `null` when
+  nothing has been read.
+* **Timestamps in replies** are ISO 8601 in UTC with milliseconds and a **`+00:00` offset,
+  never a `Z`**, such as `"2026-11-06T14:11:01.092+00:00"` (contract v2 section 3). A message's
+  `time` is the moment stored inside its id. `datetime.fromisoformat(s)` reads them on every
+  Python version the project supports (3.9 and later) and gives an aware UTC `datetime`;
+  `.astimezone()` converts it to local time for display.
 * **Timestamps in requests** (only the `time` filter of `GET chat/{chat_id}/messages`): ISO 8601
   (`"2026-11-05T10:00:00Z"`, `"2026-11-05T17:00:00+07:00"`, `"...+0700"`, `"2026-11-05"`; no zone
   means UTC) or epoch seconds as a JSON number. The server converts the value to UTC first; one
@@ -214,11 +227,12 @@ of section 1.3: `253 NOT_FOUND`, `251 INVALID_SESSION`, `252 CONNECTION_IN_USE`,
 ### 1.6 Text fields
 
 * Text is **trimmed** (leading and trailing whitespace removed) before its length is checked and
-  before it is stored. The one exception is `content` in `POST chat/{chat_id}/message`, which is
-  stored exactly as sent. Lengths count characters, not bytes.
+  before it is stored. The exceptions are `text`/`content` in `POST chat/{chat_id}/message` and
+  the passwords, which are kept exactly as sent (a password may be nothing but spaces). Lengths
+  count characters, not bytes.
 * **Control characters** (Unicode category Cc) are refused with `250 INVALID_FIELD`. Message
-  content, DM text and group descriptions may contain newlines (`\n`, `\r`) and tabs (`\t`);
-  names and every other text field may not.
+  text, DM text and group descriptions may contain newlines (`\n`, `\r`) and tabs (`\t`);
+  names, passwords and every other text field may not.
 * Integers must be JSON integers: `true`, `5.0` and `"5"` are refused.
 
 ### 1.7 Rate limits
@@ -239,14 +253,15 @@ turns that limit off.
 
 Other limits:
 
-* **Challenges per address**: register and password-change challenges cost the server a
-  Diffie-Hellman step, so each client address may ask for `CHALLENGE_RATE_PER_MINUTE` (30 a
-  minute, burst `CHALLENGE_BURST` 15; 120 and 40 in `docker-compose.yml`). Over it:
-  `252 TOO_MANY_ATTEMPTS`.
-* **Failed passwords**: 5 failed answers per (username, address) within 5 minutes, failed logins
-  and failed password changes counted together; 50 per address for usernames that do not exist.
-  Over it: `252 TOO_MANY_ATTEMPTS`. An IPv6 address counts as its whole /64. A correct login or
-  password change clears the failures counted for that username from that address.
+* **Registrations per address**: `POST users` runs PBKDF2 (`SCRAM_ITERATIONS` rounds) before it
+  stores anything, so each client address may send `REGISTER_RATE_PER_MINUTE` (30 a minute, burst
+  `REGISTER_BURST` 15; 120 and 40 in `docker-compose.yml`). Over it: `252 RATE_LIMITED` with
+  `retry_after`.
+* **Failed logins**: 5 per (username, address) within 5 minutes; 50 per address for usernames
+  that do not exist, counted per address rather than per name, so made-up names cannot lock
+  anybody out. Over it: `252 RATE_LIMITED`. An IPv6 address counts as its whole /64. A correct
+  login clears the failures counted for that username from that address. The attempt is counted
+  before the password is checked, so requests sent in parallel cannot all slip under the limit.
 * **Pending requests**: nobody may have more than `MAX_PENDING_REQUESTS` (100) pending DM requests
   and invites sent, or received: `252 LIMIT_REACHED`. `0` turns this cap off. It is checked when a
   request is sent, so lowering it leaves the requests that already exist in place.
@@ -262,25 +277,25 @@ The same object has the same shape everywhere it appears.
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `user_id` | string | UUID |
-| `username` | string | 3–32 characters from `A–Z a–z 0–9 _ . -`; unique without regard to case. It can change (`PATCH users/profile`, `event/profile`): identify people by `user_id`. |
-| `text_color` | string | `"#rrggbb"` in lower case; default `"#171717"` |
-| `text_bg_color` | string | `"#rrggbb"` in lower case; default `"#f2f2f2"`; never equal to `text_color` |
+| `username` | string | 3–32 characters from `A–Z a–z 0–9 _ . -`; unique without regard to case. It can change (`PATCH users/profile`, `users/profile_changed`): identify people by `user_id`. |
+| `text_color` | string | `"#RRGGBB"` in UPPER case; default `"#171717"` |
+| `background` | string | `"#RRGGBB"` in UPPER case; default `"#F2F2F2"`; never equal to `text_color`. Requests may spell it `text_bg_color` and may use either case (section 2.3). |
 | `online` | boolean | the account has a logged-in connection (or lost its last one less than 2 s ago) |
 | `created_at` | timestamp | when the account was made |
 
 The entries of `GET users/online` and `GET users/search` are a User without `created_at`, plus
-`is_self` (boolean: this is you). `event/presence` and `event/profile` carry a User without
+`is_self` (boolean: this is you). `users/status` and `users/profile_changed` carry a User without
 `created_at`.
 
 **User ref**: a user inside another object (`sender`, `from`, `to`, `created_by`, `invited_by`,
-the `user` of `event/group_updated`): `user_id`, `username`, `text_color`, `text_bg_color`. A
+the `user` of `chat/members_changed`): `user_id`, `username`, `text_color`, `background`. A
 DM's `peer` and an invite's `user` add `online` (boolean).
 
 **Member**: an entry of `members`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `user_id`, `username`, `text_color`, `text_bg_color` | | as in User |
+| `user_id`, `username`, `text_color`, `background` | | as in User |
 | `role` | string | `"owner"` for the group's creator (again after leaving and joining back), `"member"` for everyone else and for both people of a DM. The role gives no extra rights. |
 | `joined_at` | timestamp | when they joined the group; for a DM, when it was accepted |
 | `online` | boolean | |
@@ -291,16 +306,21 @@ Members are listed in `joined_at` order, then by `user_id`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `message_id` | string | UUIDv7 (section 1.4) |
+| `id` | string | UUIDv7 (section 1.4). NOT `message_id`. |
 | `chat_id` | string | |
 | `kind` | string | `"text"` (written by a user) or `"system"` (`"bob joined the group"`, `"bob left the group"`) |
-| `content` | string | 1–4000 characters. In `last_message` of a chat item it is cut to 120 characters (119 and `"…"`). |
-| `created_at` | timestamp | the time inside `message_id` |
-| `sender` | User ref or null | `null` for system lines; names and colours are the sender's current ones |
+| `text` | string | 1–4000 characters. In `last_message` of a chat item it is cut to 120 characters (119 and `"…"`). NOT `content`. |
+| `time` | timestamp | the moment inside `id`. NOT `created_at`. |
+| `sender` | string or null | the sender's username **as a string**, their current one; `null` on a system line |
+| `sender_id` | string or null | the sender's `user_id`; `null` on a system line |
+
+A system line therefore has `sender_id: null` and `sender: null`; the GUI shows it as
+`[System]`. To draw a sender's colours, look the `sender_id` up in the chat's `members` (or in
+`GET users/online`), since the message carries only the name.
 
 **Chat item**: an entry of `GET chats`. Every reply and push that adds a chat to your list
 carries it in this shape: `chat` in `POST chats`, `POST chat/{chat_id}/join`,
-`POST users/requests/{request_id}/accept`, `POST users/{user_id}/dm`, and `event/chat`.
+`POST users/requests/{request_id}/accept`, `POST users/{user_id}/dm`, and `chats/new`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -309,12 +329,13 @@ carries it in this shape: `chat` in `POST chats`, `POST chat/{chat_id}/join`,
 | `is_dm` | boolean | `kind == "dm"` |
 | `name` | string | the group's name; for a DM, the other person's username |
 | `description` | string | the group's description; `""` for a DM |
-| `role` | string | `"owner"` or `"member"` (always `"member"` in a DM) |
+| `role` | string | `"owner"` or `"member"` (always `"member"` in a DM, and while `pending`) |
 | `member_count` | integer | members (2 for a DM) |
-| `unread` | integer | messages after your read marker that someone else sent (system lines count) |
-| `last_read_message_id` | string or null | your read marker |
-| `last_message` | Message or null | the newest message, content cut to 120 characters |
-| `last_activity` | timestamp | `created_at` of the newest message, or when the chat was made if it has none |
+| `pending` | boolean | `true` for a group invitation you have not answered yet: the chat is in your list, but you are not a member of it yet (section 2.5). `false` for every chat you are really in. |
+| `unread` | integer | messages after your read marker that someone else sent (system lines count); `0` while `pending` |
+| `last_read_message_id` | string or null | your read marker; `null` while `pending` |
+| `last_message` | Message or null | the newest message, text cut to 120 characters; `null` while `pending` (you may not read the group yet) |
+| `last_activity` | timestamp | the `time` of the newest message, or when the chat was made if it has none; when the invitation was sent while `pending` |
 | `peer` | User ref + `online` | DMs only: the other person |
 
 **Chat info**: `chat` of `GET chat/{chat_id}/info`, and `info` in the join and invite-accept
@@ -324,7 +345,7 @@ replies.
 | ----- | ---- | ------- |
 | `chat_id`, `kind`, `is_dm`, `description` | | as in Chat item |
 | `name` | string | the group's name; for a DM you are in, the other person's username |
-| `created_by` | User ref or null | the group's creator (for a DM, who sent the first DM). While the creator is not a member, its `username`, `text_color` and `text_bg_color` are `null`. |
+| `created_by` | User ref or null | the group's creator (for a DM, who sent the first DM). While the creator is not a member, its `username`, `text_color` and `background` are `null`. |
 | `created_at` | timestamp | when the chat was made (for a DM, when the request was sent) |
 | `member_count` | integer | all members |
 | `online_count` | integer | members online now |
@@ -347,7 +368,7 @@ replies.
 | `invited_at` | timestamp | |
 
 **Group**: an entry of `GET chats/groups`, `group` in `POST chats`, and `group` in
-`event/group_created` (there without `joined`).
+`chats/group_created` (there without `joined`).
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -372,7 +393,7 @@ replies.
 | `chat` | object | `kind` `"invite"` only: `{"chat_id", "name"}` of the group |
 
 A declined or cancelled request is deleted (a DM request together with its first message), so
-`"declined"` and `"cancelled"` appear only in the reply to that answer and in `event/request`.
+`"declined"` and `"cancelled"` appear only in the reply to that answer and in `users/request`.
 Afterwards its `request_id` answers `253 REQUEST_NOT_FOUND`. An accepted request stays readable
 with `"accepted"`; answering it again gives `252 REQUEST_CLOSED`.
 
@@ -384,252 +405,139 @@ Each call starts with what changed compared with the README's one-line descripti
 
 ### 2.1 `POST users`: register
 
-Auth: none. Two requests on the same connection.
+Auth: none. One request.
 
-**Changed**: the README sends `username` and `password`. The backend refuses any message that
-contains `password`, `old_password` or `new_password` (`250 PLAINTEXT_PASSWORD`) and uses a
-challenge-response instead: the password never crosses the socket, and the password verifier
-travels encrypted under a fresh Diffie-Hellman key. `RegisterFlow` in `socketcord/scram.py`
-(standard library only) builds both messages; [PROTOCOL.md](PROTOCOL.md) section 4 has the
-math. A new account has the default colours and no session: log in afterwards.
+**Changed**: nothing in the message — the README's `{username, password}` is exactly what this
+call takes. The password is in the message body as clear text on an unencrypted socket; the
+server derives PBKDF2-HMAC-SHA256(password, 16 random bytes, `SCRAM_ITERATIONS`) and stores only
+the hash. A new account has the default colours and no session: log in afterwards.
 
-**Step 1 request**
+**Request**
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
 | `username` | string | yes | 3–32 characters from `A–Z a–z 0–9 _ . -` after trimming; unique without regard to case |
-| `client_nonce` | string | yes | base64 text, 16–128 characters (`RegisterFlow` sends 18 random bytes, 24 characters) |
-| `device_id` | string | no | 8–128 characters from `A–Z a–z 0–9 _ . : -`. `RegisterFlow` sends `scram.device_fingerprint()`: the first 32 hex characters of SHA-256 over `"socketcord-device:"` followed by the MAC address (`uuid.getnode()`) as 12 lower-case hex digits. It is for the one-account-per-device-per-day rule ([PROTOCOL.md](PROTOCOL.md) section 5). |
+| `password` | string | yes | 1–256 characters, not trimmed (spaces count), no control characters. The server sets no strength rule: any non-empty password is accepted, so whatever the GUI lets the user type is stored. Unicode is normalized with NFKC before hashing, so a composed and a decomposed accent are the same password. |
+| `device_id` | string | no | 8–128 characters from `A–Z a–z 0–9 _ . : -`. The reference client sends `scram.device_fingerprint()`: the first 32 hex characters of SHA-256 over `"socketcord-device:"` followed by the MAC address (`uuid.getnode()`) as 12 lower-case hex digits. It is for the one-account-per-device-per-day rule ([PROTOCOL.md](PROTOCOL.md) section 5). |
 
-**Step 1 reply**
-
-| Field | Type | Meaning |
-| ----- | ---- | ------- |
-| `step` | string | `"challenge"` |
-| `challenge_id` | string | UUID. Answer it once, on this connection, within `expires_in` seconds. |
-| `salt` | string | base64 of 16 bytes, chosen by the server |
-| `iterations` | integer | PBKDF2 rounds (`SCRAM_ITERATIONS`, default 600000) |
-| `server_nonce` | string | base64 of 18 bytes |
-| `expires_in` | integer | seconds (`CHALLENGE_TTL_SECONDS`, default 60) |
-| `dh_group` | string | `"modp2048"` (RFC 3526 group 14) |
-| `dh_public` | string | base64 of 256 bytes: the server's Diffie-Hellman public value |
-
-**Step 2 request** (a message with `challenge_id` is step 2)
-
-| Field | Type | Required | Rules |
-| ----- | ---- | -------- | ----- |
-| `challenge_id` | string | yes | from step 1, 1–64 characters |
-| `dh_public` | string | yes | base64 of 256 bytes; the client's public value, in 2 .. p−2 |
-| `wrapped_verifier` | string | yes | base64 of 64 bytes: (StoredKey ‖ ServerKey) XOR pad |
-| `wrap_tag` | string | yes | base64 of 32 bytes |
-
-The AuthMessage that `wrap_tag` and `server_signature` cover holds the username trimmed and in
-lower case (`scram.canonical_username`), whatever letter case was typed; `RegisterFlow` builds it
-that way ([PROTOCOL.md](PROTOCOL.md) section 4). The account itself keeps the case as typed.
-
-**Step 2 reply**
+**Reply** (`path`: `login/created`)
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `step` | string | `"done"` |
 | `user_id` | string | the new account |
-| `user` | User | the new account (`online` is `false`) |
-| `server_signature` | string | base64 of 32 bytes; `RegisterFlow.verify(reply)` checks it |
+| `username` | string | the name as stored (the case that was typed, trimmed) |
+
+No session token: the client logs in next. The reply has no password field, and neither has any
+other reply in this file.
 
 **Errors**
 
 | Status | Code | When |
 | ------ | ---- | ---- |
-| 250 | `PLAINTEXT_PASSWORD` | the message has `password`, `old_password` or `new_password` (`field` names it) |
-| 252 | `TOO_MANY_ATTEMPTS` | step 1: this address asked for too many challenges (section 1.7); checked before the request's fields (only the plaintext-password check comes first); `retry_after` |
-| 250 | `MISSING_FIELD`, `INVALID_FIELD` | a field is missing or malformed |
-| 250 | `INVALID_USERNAME` | step 1: the username breaks the rules (`field`: `"username"`) |
-| 252 | `USERNAME_TAKEN` | step 1, or step 2 if someone took the name in between (`field`: `"username"`) |
-| 252 | `RATE_LIMITED` | step 1 or 2: this device id or address already made `REG_LIMIT_DEVICE_MAX` / `REG_LIMIT_IP_MAX` accounts within `REG_LIMIT_WINDOW_HOURS`; `retry_after` is when the oldest one stops counting |
-| 250 | `CONNECTION_CLOSED` | step 1: the connection closed while the challenge was being made, so none was kept; nobody reads this reply |
-| 251 | `CHALLENGE_INVALID` | step 2: the challenge is unknown, used, expired, or was issued on another connection |
-| 251 | `INVALID_PROOF` | step 2: `wrap_tag` does not match (wrong DH value, or the data was changed on the way) |
+| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `username` or `password` is missing or malformed (`field` names it) |
+| 250 | `INVALID_USERNAME` | the username breaks the rules (`field`: `"username"`) |
+| 252 | `USERNAME_TAKEN` | the name is taken, whatever its letter case (`field`: `"username"`) |
+| 252 | `RATE_LIMITED` | this address asked to register too often (`REGISTER_RATE_PER_MINUTE`, section 1.7), or this device id or address already made `REG_LIMIT_DEVICE_MAX` / `REG_LIMIT_IP_MAX` accounts within `REG_LIMIT_WINDOW_HOURS`; `retry_after` says how long to wait |
 | | common errors | section 1.5 (the authentication errors do not apply) |
-
-Step 2 uses up the challenge before it checks anything else, so after any step-2 error start
-again with a new `RegisterFlow`.
 
 **Pushes**: none.
 
-**Example**. Step 1, `POST users` without credentials:
+**Example**. `POST users` without credentials:
 
 ```json
-{
-  "rid": 1,
-  "username": "alice",
-  "client_nonce": "4ogG4aPY/WxBB/JbBlHvBaLu",
-  "device_id": "device-alice-01"
-}
+{"rid": 1, "username": "alice", "password": "correct horse", "device_id": "device-alice-01"}
 ```
 
 ```json
 {
-  "path": "users",
+  "path": "login/created",
   "method": "POST",
   "rid": 1,
-  "step": "challenge",
-  "challenge_id": "2fe56260-20e5-4c35-a864-5d49bd29535e",
-  "salt": "7HEMsKi1LzC5Q/V2mdEKpA==",
-  "iterations": 600000,
-  "server_nonce": "ZjLBC/HNfR4cAy8FHy4hkdTv",
-  "expires_in": 60,
-  "dh_group": "modp2048",
-  "dh_public": "2/bwyxKLzRVkYKhr...5A6KTA=="
-}
-```
-
-Step 2:
-
-```json
-{
-  "rid": 2,
-  "challenge_id": "2fe56260-20e5-4c35-a864-5d49bd29535e",
-  "dh_public": "6K9/X/p/6mL1jkRe...XP9T3A==",
-  "wrapped_verifier": "1mnevW0tqhn9wcmy...FSm3Hg==",
-  "wrap_tag": "3fx0rUJd4OF5JRA/na/UWOQMDST1oJp728/z9Ye4hHs="
-}
-```
-
-```json
-{
-  "path": "users",
-  "method": "POST",
-  "rid": 2,
-  "step": "done",
-  "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-  "user": {
-    "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-    "username": "alice",
-    "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
-    "online": false,
-    "created_at": "2026-11-06T14:10:59.433Z"
-  },
-  "server_signature": "ToXGgX621PDievIuuYE1ajIdatD3R9t1eBYyFbp6hgs="
+  "user_id": "5e3aa6d9-8936-40ff-b9ee-c3278968b871",
+  "username": "alice"
 }
 ```
 
 ### 2.2 `POST users/login`: log in
 
-Auth: none. Two requests on the same connection.
+Auth: none. One request.
 
-**Changed**: challenge-response instead of `username` and `password` (`LoginFlow` in
-`socketcord/scram.py`). The final reply carries the `user_id` and the new `session_token` that
-every later request puts in its header, plus `expires_at` and the `user`. An account has one
-session: this login ends the previous one on every other connection.
+**Changed**: nothing in the message — `{username, password}`, as in the README. The reply carries
+the `user_id` and the `session_token` that every later request puts in its header, the account's
+name and colours at the top level, and the whole `user` object. An account has one session: this
+login ends the previous one on every other connection, which get `login/revoked` with reason
+`logged_in_elsewhere`.
 
-**Step 1 request**
-
-| Field | Type | Required | Rules |
-| ----- | ---- | -------- | ----- |
-| `username` | string | yes | as in register; letter case does not matter |
-| `client_nonce` | string | yes | base64 text, 16–128 characters |
-
-**Step 1 reply**: `step` (`"challenge"`), `challenge_id`, `salt` (the account's), `iterations`
-(the account's), `server_nonce`, `expires_in`, as in register, without the DH fields. A username
-that does not exist gets a challenge too, with a stable made-up salt, so this reply does not say
-whether the name exists.
-
-**Step 2 request**
+**Request**
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
-| `challenge_id` | string | yes | from step 1 |
-| `client_proof` | string | yes | base64 of 32 bytes: ClientKey XOR HMAC(StoredKey, AuthMessage) |
+| `username` | string | yes | as in register; letter case does not matter, and the name is trimmed |
+| `password` | string | yes | 1–256 characters, as in register |
 
-The AuthMessage holds the username trimmed and in lower case (`scram.canonical_username`),
-whatever letter case the user typed; `LoginFlow` builds it that way ([PROTOCOL.md](PROTOCOL.md)
-section 4). A proof made over a name with capital letters, as typed, fails with
-`251 INVALID_CREDENTIALS`.
-
-**Step 2 reply**
+**Reply** (`path`: `login/success`)
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `step` | string | `"done"` |
-| `user_id` | string | put it in the User ID field of every later request |
-| `session_token` | string | UUID; put it in the Session Token field of every later request |
-| `expires_at` | timestamp | when the session ends (`SESSION_TTL_HOURS`, default 168 hours, after this login) |
-| `user` | User | your account (`online` is `true`) |
-| `server_signature` | string | base64 of 32 bytes; `LoginFlow.verify(reply)` checks it. If it is wrong, the server does not know this account's verifier: treat it as a fake server. |
+| `user_id` | string | the account |
+| `session_token` | string | UUID; put it in the header of every later request |
+| `expires_at` | timestamp | when the session runs out (`SESSION_TTL_HOURS`, default 168) |
+| `username` | string | the name as stored |
+| `text_color` | string | `"#RRGGBB"`, upper case |
+| `background` | string | `"#RRGGBB"`, upper case |
+| `user` | User | the same account as one object, with `online` and `created_at` |
 
 **Errors**
 
 | Status | Code | When |
 | ------ | ---- | ---- |
-| 250 | `PLAINTEXT_PASSWORD` | as in register |
-| 250 | `MISSING_FIELD`, `INVALID_FIELD`, `INVALID_USERNAME` | a field is missing or malformed |
-| 252 | `TOO_MANY_ATTEMPTS` | step 1 or 2: too many failed passwords for this username from this address, or for unknown usernames from this address (section 1.7); `retry_after` |
-| 251 | `CHALLENGE_INVALID` | step 2: the challenge is unknown, used, expired or from another connection; or the password was changed between step 1 and step 2 |
-| 251 | `INVALID_CREDENTIALS` | step 2: wrong password, or a username that does not exist (the same answer) |
-| 251 | `INVALID_SESSION` | step 2: another login of the same account replaced this new session at the same moment |
-| 250 | `CONNECTION_CLOSED` | step 1: the connection closed while the challenge was being made, so none was kept; nobody reads this reply |
-| | common errors | section 1.5 |
+| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `username` or `password` is missing or malformed |
+| 250 | `INVALID_USERNAME` | the username cannot be one: it breaks the character or length rules |
+| 251 | `INVALID_CREDENTIALS` | **wrong password, or no such account** — the same code and the same `detail` ("wrong username or password") for both, so the reply does not say which accounts exist. An unknown name also costs the same PBKDF2 run, so it cannot be told apart by how long the reply takes. |
+| 252 | `RATE_LIMITED` | too many failed logins for this (username, address), or too many for unknown names from this address (section 1.7); `retry_after` |
+| 251 | `INVALID_SESSION` | the account logged in somewhere else at the same moment, so this session was already replaced; log in again |
+| | common errors | section 1.5 (the authentication errors do not apply) |
 
-**Pushes** (step 2):
+**Pushes**: `login/revoked` (reason `logged_in_elsewhere`) to every connection that still used the
+previous session; `users/status` to everyone else if the account was offline until now.
 
-* `event/session_revoked` with reason `logged_in_elsewhere` to every connection that still uses
-  the account's previous token; they are logged out. This happens even when this login then
-  answers `251 INVALID_SESSION`. A login is never refused for having too many connections: on a
-  sixth connection it replaces the session like any login, so the five old connections get
-  `logged_in_elsewhere`.
-* `event/presence` (online) to everyone else, if the account was offline.
-* If this connection was logged in as another account, that account is logged out here first
-  (`event/presence` offline at once, if it has no other connection).
-
-**Example**. Step 1:
+**Example**
 
 ```json
-{"rid": 3, "username": "alice", "client_nonce": "sgUXTApl+1Xcd664E6hlnwna"}
+{"rid": 2, "username": "alice", "password": "correct horse"}
 ```
 
 ```json
 {
-  "path": "users/login",
+  "path": "login/success",
   "method": "POST",
-  "rid": 3,
-  "step": "challenge",
-  "challenge_id": "e5332ff9-8c33-410a-a880-43e3c9d5d6f8",
-  "salt": "7HEMsKi1LzC5Q/V2mdEKpA==",
-  "iterations": 600000,
-  "server_nonce": "X2QLufWJ03JMGcQkrdgaQaJ3",
-  "expires_in": 60
-}
-```
-
-Step 2:
-
-```json
-{
-  "rid": 4,
-  "challenge_id": "e5332ff9-8c33-410a-a880-43e3c9d5d6f8",
-  "client_proof": "nD4csJpkJXI63dfI/MOYphmUTGshmaLBJWuhszkMGwQ="
-}
-```
-
-```json
-{
-  "path": "users/login",
-  "method": "POST",
-  "rid": 4,
-  "step": "done",
-  "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-  "session_token": "88cd7e6a-eda2-488f-b247-7b933fda3de5",
-  "expires_at": "2026-11-13T14:10:59.434Z",
+  "rid": 2,
+  "user_id": "5e3aa6d9-8936-40ff-b9ee-c3278968b871",
+  "session_token": "e595f692-c2dc-465a-b330-b9f166133886",
+  "expires_at": "2026-11-14T09:34:05.381+00:00",
+  "username": "alice",
+  "text_color": "#171717",
+  "background": "#F2F2F2",
   "user": {
-    "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+    "user_id": "5e3aa6d9-8936-40ff-b9ee-c3278968b871",
     "username": "alice",
     "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
+    "background": "#F2F2F2",
     "online": true,
-    "created_at": "2026-11-06T14:10:59.433Z"
-  },
-  "server_signature": "MKPi9/Mt7vE83Lmz8ulETBqpkb3BoRz/85WtJtG+Fn4="
+    "created_at": "2026-11-07T09:34:05.380+00:00"
+  }
+}
+```
+
+A wrong password and an unknown name both answer:
+
+```json
+{
+  "path": "users/login",
+  "method": "POST",
+  "rid": 6,
+  "error": "INVALID_CREDENTIALS",
+  "detail": "wrong username or password"
 }
 ```
 
@@ -640,16 +548,16 @@ Auth: yes.
 **Changed**: the profile is the username and the two colours of the team's data model (User Text
 Color, User Text Background Color); there is no display name and no bio. The GUI draws every
 username in its owner's text colour on its owner's background colour. `background` is accepted as
-another name for `text_bg_color` (the frontend README's word).
+an older name for `background`.
 
-**Request** (at least one of `username`, `text_color`, `text_bg_color`, `background`)
+**Request** (at least one of `username`, `text_color`, `background`, `background`)
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
 | `username` | string | no | the new name: trimmed, then 3–32 characters from `A–Z a–z 0–9 _ . -`, the same rule as `POST users`. Unique without regard to case: a name someone else has (in any case) is refused; your own name in another case (`bob` → `Bob`) is fine, and so is your current name. |
 | `text_color` | string | no | `"#rrggbb"`, either letter case; stored in lower case |
-| `text_bg_color` | string | no | the same |
-| `background` | string | no | the same as `text_bg_color`. Sending both is allowed only with the same colour (letter case aside). |
+| `background` | string | no | the same |
+| `background` | string | no | an older name for `background`. Sending both is allowed only with the same colour (letter case aside). |
 
 After the change the two colours must differ. Everything sent is changed in one step: if
 anything is refused, nothing changes.
@@ -658,9 +566,8 @@ anything is refused, nothing changes.
 were; everything that shows the user (members, message senders, DM names, requests, the online
 list) shows the new name from now on. Stored system lines such as `"bob joined the group"` keep
 the old text. Log in with the new name afterwards (any letter case); the old name stops working at
-once, also for a login challenge fetched just before the rename, and someone else may register it.
-The password keeps working, because the challenge-response verifier does not depend on the name
-([PROTOCOL.md](PROTOCOL.md) section 4).
+once, and someone else may register it. The password keeps working, because the stored hash does
+not depend on the name.
 
 **Reply**
 
@@ -675,17 +582,17 @@ The password keeps working, because the challenge-response verifier does not dep
 | 250 | `INVALID_FIELD` | `username` is not a string, or is empty or over 64 characters after trimming, or has a control character (`field`: `"username"`) |
 | 250 | `INVALID_USERNAME` | `username` breaks the 3–32 `A–Z a–z 0–9 _ . -` rule (`field`: `"username"`) |
 | 250 | `INVALID_FIELD` | a colour is not a string, is longer than 7 characters, or is not `#` and 6 hex digits (`field` names it) |
-| 250 | `INVALID_FIELD` | `text_bg_color` and `background` are both sent with different colours (`field`: `"background"`) |
+| 250 | `INVALID_FIELD` | `background` and `background` are both sent with different colours (`field`: `"background"`) |
 | 250 | `MISSING_FIELD` | none of the four fields was sent (`field`: `"text_color"`) |
-| 250 | `INVALID_FIELD` | the text colour would equal the background colour (`field`: `"text_bg_color"` or `"background"`, whichever was sent; else `"text_color"`) |
+| 250 | `INVALID_FIELD` | the text colour would equal the background colour (`field`: `"background"` or `"background"`, whichever was sent; else `"text_color"`) |
 | 252 | `USERNAME_TAKEN` | another account has that name, in any letter case (`field`: `"username"`; the same error `POST users` gives) |
 | 252 | `RATE_LIMITED` | more than `PROFILE_RATE_PER_MINUTE` changes (section 1.7) |
 | 253 | `USER_NOT_FOUND` | the account no longer exists |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/profile` (section 4.8) to every logged-in connection except this one (your
+**Pushes**: `users/profile_changed` (section 4.8) to every logged-in connection except this one (your
 other connections included), for a rename as for a colour change. `GET users/online` and later
-`event/presence` show the new name.
+`users/status` show the new name.
 
 **Example**: bob renames himself and changes his colours at once:
 
@@ -695,16 +602,16 @@ other connections included), for a rename as for a colour change. `GET users/onl
 
 ```json
 {
-  "path": "users/profile",
+  "path": "profile/updated",
   "method": "PATCH",
   "rid": 5,
   "user": {
     "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
     "username": "Bobby",
-    "text_color": "#ffffff",
-    "text_bg_color": "#1f6feb",
+    "text_color": "#FFFFFF",
+    "background": "#1F6FEB",
     "online": true,
-    "created_at": "2026-11-07T07:22:23.959Z"
+    "created_at": "2026-11-07T07:22:23.959+00:00"
   }
 }
 ```
@@ -728,7 +635,7 @@ carol tries to take alice's name (in another case):
 
 ### 2.4 `GET users/info`: your account
 
-Auth: yes. **Changed**: `user` has `text_color` and `text_bg_color` instead of a display name
+Auth: yes. **Changed**: `user` has `text_color` and `background` instead of a display name
 and bio.
 
 **Request**: no fields.
@@ -745,16 +652,16 @@ and bio.
 
 ```json
 {
-  "path": "users/info",
+  "path": "profile/info",
   "method": "GET",
   "rid": 5,
   "user": {
     "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
     "username": "alice",
     "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
+    "background": "#F2F2F2",
     "online": true,
-    "created_at": "2026-11-06T14:10:59.433Z"
+    "created_at": "2026-11-06T14:10:59.433+00:00"
   }
 }
 ```
@@ -763,8 +670,9 @@ and bio.
 
 Auth: yes.
 
-**Changed**: each entry is a Chat item (section 1.8) with the fields `chat_page.set_chats()`
-expects (`chat_id`, `name`, `unread`, `last_activity`, `is_dm`), and the list is paged.
+**Changed**: each entry is a Chat item (section 1.8) with the fields the GUI's chat list needs
+(`chat_id`, `name`, `is_dm`, `pending`, `unread`, `last_activity`), the list also holds the group
+invitations you have not answered (`pending`: `true`), and it is paged.
 
 **Request**
 
@@ -777,11 +685,21 @@ expects (`chat_id`, `name`, `unread`, `last_activity`, `is_dm`), and the list is
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `chats` | list of Chat item | the groups you joined and your accepted DMs, latest activity first (on a tie, the newer last message first, then by `chat_id`) |
+| `chats` | list of Chat item | the groups you joined, your accepted DMs, and the group invitations you have not answered (`pending`: `true`), latest activity first (for an invitation, when it was sent; on a tie, the newer last message first, then by `chat_id`) |
 | `offset` | integer | as requested |
 | `has_more` | boolean | more chats follow this page |
 
-Pending DM requests and invites are not chats yet: see `GET users/requests`.
+A `pending` row is an invitation, not a membership: the group's messages and info still answer
+`252 NOT_A_MEMBER` until you accept it with `POST chat/{chat_id}/invite/accept` (section 3.16).
+Show it greyed out, with Accept / Reject. The row carries `name`, `member_count` and
+`last_activity` (when you were invited), and `unread` `0`, `last_message` `null`,
+`last_read_message_id` `null`. At most 50 invitations are listed. Accepting one turns it into an
+ordinary row; rejecting it, or the inviter cancelling it, removes it (and pushes
+`chat/members_changed` with `change` `"invite_cancelled"`, section 4.6).
+
+Pending **DM** requests are not rows here: a DM room does not exist until it is accepted, and
+they only happen on a server started with `DM_REQUIRE_ACCEPT=true`. They are in
+`GET users/requests` (section 3.4) and arrive as `users/request` (section 4.3).
 
 **Errors**: `250 INVALID_FIELD` (`count`, `offset`); common errors. **Pushes**: none.
 
@@ -789,7 +707,7 @@ Pending DM requests and invites are not chats yet: see `GET users/requests`.
 
 ```json
 {
-  "path": "chats",
+  "path": "chats/list",
   "method": "GET",
   "rid": 38,
   "chats": [
@@ -798,30 +716,27 @@ Pending DM requests and invites are not chats yet: see `GET users/requests`.
       "kind": "dm",
       "is_dm": true,
       "name": "bob",
+      "pending": false,
       "description": "",
       "role": "member",
       "member_count": 2,
       "unread": 0,
       "last_read_message_id": "01a1b132-e6df-7000-a64f-067660850d0b",
       "last_message": {
-        "message_id": "01a1b132-e6df-7000-a64f-067660850d0b",
+        "id": "01a1b132-e6df-7000-a64f-067660850d0b",
         "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
         "kind": "text",
-        "content": "thanks!",
-        "created_at": "2026-11-06T14:11:05.567Z",
-        "sender": {
-          "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-          "username": "alice",
-          "text_color": "#171717",
-          "text_bg_color": "#f2f2f2"
-        }
+        "text": "thanks!",
+        "time": "2026-11-06T14:11:05.567+00:00",
+        "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+        "sender": "alice"
       },
-      "last_activity": "2026-11-06T14:11:05.567Z",
+      "last_activity": "2026-11-06T14:11:05.567+00:00",
       "peer": {
         "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
         "username": "bob",
-        "text_color": "#ffffff",
-        "text_bg_color": "#1f6feb",
+        "text_color": "#FFFFFF",
+        "background": "#1F6FEB",
         "online": true
       }
     },
@@ -830,20 +745,22 @@ Pending DM requests and invites are not chats yet: see `GET users/requests`.
       "kind": "group",
       "is_dm": false,
       "name": "Network Project",
+      "pending": false,
       "description": "term project",
       "role": "owner",
       "member_count": 3,
       "unread": 1,
       "last_read_message_id": "01a1b132-d6fa-7000-8c92-ebb7ec7525b9",
       "last_message": {
-        "message_id": "01a1b132-da2d-7000-9580-a1c0b24aabab",
+        "id": "01a1b132-da2d-7000-9580-a1c0b24aabab",
         "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
         "kind": "system",
-        "content": "carol joined the group",
-        "created_at": "2026-11-06T14:11:02.317Z",
+        "text": "carol joined the group",
+        "time": "2026-11-06T14:11:02.317+00:00",
+        "sender_id": null,
         "sender": null
       },
-      "last_activity": "2026-11-06T14:11:02.317Z"
+      "last_activity": "2026-11-06T14:11:02.317+00:00"
     }
   ],
   "offset": 0,
@@ -881,7 +798,7 @@ lists the pending invites, so "the user list with status" is `members` (with `on
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/info",
+  "path": "chat/info",
   "method": "GET",
   "rid": 21,
   "chat": {
@@ -894,9 +811,9 @@ lists the pending invites, so "the user list with status" is `members` (with `on
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:00.277Z",
+    "created_at": "2026-11-06T14:11:00.277+00:00",
     "member_count": 2,
     "online_count": 2,
     "members": [
@@ -904,18 +821,18 @@ lists the pending invites, so "the user list with status" is `members` (with `on
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "owner",
-        "joined_at": "2026-11-06T14:11:00.277Z",
+        "joined_at": "2026-11-06T14:11:00.277+00:00",
         "online": true
       },
       {
         "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
         "username": "bob",
-        "text_color": "#ffffff",
-        "text_bg_color": "#1f6feb",
+        "text_color": "#FFFFFF",
+        "background": "#1F6FEB",
         "role": "member",
-        "joined_at": "2026-11-06T14:11:00.684Z",
+        "joined_at": "2026-11-06T14:11:00.684+00:00",
         "online": true
       }
     ],
@@ -929,16 +846,16 @@ lists the pending invites, so "the user list with status" is `members` (with `on
           "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
           "username": "carol",
           "text_color": "#171717",
-          "text_bg_color": "#f2f2f2",
+          "background": "#F2F2F2",
           "online": true
         },
         "invited_by": {
           "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
           "username": "alice",
           "text_color": "#171717",
-          "text_bg_color": "#f2f2f2"
+          "background": "#F2F2F2"
         },
-        "invited_at": "2026-11-06T14:11:01.910Z"
+        "invited_at": "2026-11-06T14:11:01.910+00:00"
       }
     ],
     "invited_count": 1,
@@ -951,7 +868,7 @@ A DM, asked by one of its two people:
 
 ```json
 {
-  "path": "chat/99b362bb-971b-4f39-a15a-b95612bcd979/info",
+  "path": "chat/info",
   "method": "GET",
   "rid": 34,
   "chat": {
@@ -964,9 +881,9 @@ A DM, asked by one of its two people:
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:04.757Z",
+    "created_at": "2026-11-06T14:11:04.757+00:00",
     "member_count": 2,
     "online_count": 2,
     "members": [
@@ -974,18 +891,18 @@ A DM, asked by one of its two people:
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "member",
-        "joined_at": "2026-11-06T14:11:05.164Z",
+        "joined_at": "2026-11-06T14:11:05.164+00:00",
         "online": true
       },
       {
         "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
         "username": "bob",
-        "text_color": "#ffffff",
-        "text_bg_color": "#1f6feb",
+        "text_color": "#FFFFFF",
+        "background": "#1F6FEB",
         "role": "member",
-        "joined_at": "2026-11-06T14:11:05.164Z",
+        "joined_at": "2026-11-06T14:11:05.164+00:00",
         "online": true
       }
     ],
@@ -995,8 +912,8 @@ A DM, asked by one of its two people:
     "peer": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb",
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB",
       "online": true
     }
   }
@@ -1007,16 +924,17 @@ A DM, asked by one of its two people:
 
 Auth: members only.
 
-**Changed**: the README's filters `count`, `content` and `time` work as described below, plus
-`before_id` and `after_id` (UUID message ids). The reply adds your read marker and
-`first_unread_message_id`, which tells the GUI where to draw its NEW line.
+**Changed**: the README's filters `count`, `content` and `time` work as described below (the
+content filter is now spelled `text`, as in the message), plus `before_id` and `after_id` (UUID
+message ids). The reply adds your read marker and `first_unread_id` (NOT
+`first_unread_message_id`), which tells the GUI where to draw its NEW line.
 
 **Request** (every field optional; all given filters apply together)
 
 | Field | Type | Default | Rules |
 | ----- | ---- | ------- | ----- |
 | `count` | integer | 50 | 1–200 |
-| `content` | string | | 1–50 characters after trimming; messages whose content contains it, ignoring case; `%` and `_` match themselves |
+| `text` | string | | 1–50 characters after trimming; messages whose text contains it, ignoring case; `%` and `_` match themselves. `content` is accepted as the older name. |
 | `time` | timestamp, or object | | A timestamp: messages strictly before it. An object `{"before": t, "after": t}` (one or both keys, no others): messages strictly before and/or after. Formats in section 1.4. |
 | `before_id` | string | | messages with a smaller id (older): "load older" |
 | `after_id` | string | | messages with a larger id (newer): "catch up" after a reconnect |
@@ -1033,11 +951,11 @@ get the **newest** `count` messages that match. With only lower bounds you get t
 | `messages` | list of Message | oldest first |
 | `has_more` | boolean | more matching messages exist beyond this page: older ones for a "newest" page, newer ones for an "after" page |
 | `last_read_message_id` | string or null | your read marker |
-| `first_unread_message_id` | string or null | the oldest message of the whole chat after your read marker (filters do not change it), or `null` if there is none. Draw NEW above it when it is in `messages`. |
+| `first_unread_id` | string or null | the oldest message of the whole chat after your read marker (filters do not change it), or `null` if there is none. Draw NEW above it when it is in `messages`. |
 
 Reading messages does not mark them as read; send `POST chat/{chat_id}/read`.
 
-`first_unread_message_id` looks at every message after your marker, and `unread` in `GET chats`
+`first_unread_id` looks at every message after your marker, and `unread` in `GET chats`
 only at those someone else sent. The two still agree, because your own messages are never after
 your marker: sending one moves the marker to it, and the first message of a DM request counts as
 read for the person who sent it.
@@ -1048,7 +966,7 @@ read for the person who sent it.
 | ------ | ---- | ---- |
 | 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
 | 252 | `NOT_A_MEMBER` | a group you have not joined |
-| 250 | `INVALID_FIELD` | `count`, `before_id`, `after_id` or `content` is malformed; or `time` is not a timestamp, has a key other than `before`/`after`, or is out of range (`field` is `"time"`, `"time.before"` or `"time.after"`) |
+| 250 | `INVALID_FIELD` | `count`, `before_id`, `after_id` or `text` is malformed; or `time` is not a timestamp, has a key other than `before`/`after`, or is out of range (`field` is `"time"`, `"time.before"` or `"time.after"`) |
 | | common errors | section 1.5 |
 
 **Pushes**: none.
@@ -1058,68 +976,62 @@ message (bob joined, then alice wrote twice):
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/messages",
+  "path": "chat/messages",
   "method": "GET",
   "rid": 13,
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
   "messages": [
     {
-      "message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
+      "id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
       "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
       "kind": "system",
-      "content": "bob joined the group",
-      "created_at": "2026-11-06T14:11:00.684Z",
+      "text": "bob joined the group",
+      "time": "2026-11-06T14:11:00.684+00:00",
+      "sender_id": null,
       "sender": null
     },
     {
-      "message_id": "01a1b132-d564-7000-8685-b94d127a7451",
+      "id": "01a1b132-d564-7000-8685-b94d127a7451",
       "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
       "kind": "text",
-      "content": "hello group",
-      "created_at": "2026-11-06T14:11:01.092Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hello group",
+      "time": "2026-11-06T14:11:01.092+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     },
     {
-      "message_id": "01a1b132-d6fa-7000-8c92-ebb7ec7525b9",
+      "id": "01a1b132-d6fa-7000-8c92-ebb7ec7525b9",
       "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
       "kind": "text",
-      "content": "  second  ",
-      "created_at": "2026-11-06T14:11:01.498Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "  second  ",
+      "time": "2026-11-06T14:11:01.498+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     }
   ],
   "has_more": false,
   "last_read_message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
-  "first_unread_message_id": "01a1b132-d564-7000-8685-b94d127a7451"
+  "first_unread_id": "01a1b132-d564-7000-8685-b94d127a7451"
 }
 ```
 
 Filter examples: `{"count": 20, "before_id": "01a1b132-d564-7000-8685-b94d127a7451"}` (older
 page), `{"after_id": "01a1b132-d564-7000-8685-b94d127a7451"}` (newer messages),
-`{"content": "deadline", "time": {"after": "2026-11-01T00:00:00+07:00"}}`.
+`{"text": "deadline", "time": {"after": "2026-11-01T00:00:00+07:00"}}`.
 
 ### 2.8 `POST chat/{chat_id}/message`: send a message
 
 Auth: members only.
 
-**Changed**: the field is `content`, and the reply carries the stored message. Every online
-member gets it at once as `event/message`.
+**Changed**: the field is `text` (`content`, the README's word, is accepted as well), and the
+reply carries the stored message. Every online member gets it at once as `chat/new_message`.
 
 **Request**
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
-| `content` | string | yes | 1–4000 characters and not only whitespace; stored exactly as sent (not trimmed); newlines and tabs allowed |
+| `text` | string | yes | 1–4000 characters and not only whitespace; stored exactly as sent (not trimmed); newlines and tabs allowed |
+| `content` | string | — | the older name for `text`; send one of the two. If both are sent, `content` wins and `text` is ignored. |
 
 **Reply**
 
@@ -1135,37 +1047,33 @@ Your read marker moves to this message, so your own messages never count as unre
 | ------ | ---- | ---- |
 | 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
 | 252 | `NOT_A_MEMBER` | a group you have not joined |
-| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `content` is missing, not a string, longer than 4000 characters, blank ("'content' cannot be blank") or has a control character |
+| 250 | `MISSING_FIELD`, `INVALID_FIELD` | neither `text` nor `content` was sent (`field`: `"content"`), or the one that was sent is not a string, longer than 4000 characters, blank ("'text' cannot be blank") or has a control character (`field` names the spelling you used) |
 | 252 | `RATE_LIMITED` | more than `MESSAGE_RATE_PER_MINUTE` (shared with DMs) |
 | 253 | `NOT_FOUND` | the chat was deleted while sending |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/message` to every logged-in connection of the chat's members, except the
+**Pushes**: `chat/new_message` to every logged-in connection of the chat's members, except the
 connection that sent it (your other connections get it).
 
 **Example**
 
 ```json
-{"rid": 12, "content": "hello group"}
+{"rid": 12, "text": "hello group"}
 ```
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/message",
+  "path": "chat/sent",
   "method": "POST",
   "rid": 12,
   "message": {
-    "message_id": "01a1b132-d564-7000-8685-b94d127a7451",
+    "id": "01a1b132-d564-7000-8685-b94d127a7451",
     "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
     "kind": "text",
-    "content": "hello group",
-    "created_at": "2026-11-06T14:11:01.092Z",
-    "sender": {
-      "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-      "username": "alice",
-      "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
-    }
+    "text": "hello group",
+    "time": "2026-11-06T14:11:01.092+00:00",
+    "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+    "sender": "alice"
   }
 }
 ```
@@ -1185,7 +1093,7 @@ keys.
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
-| `message` | string | yes | 1–4000 characters after trimming (unlike `POST chat/{chat_id}/message`, leading and trailing whitespace is removed); newlines and tabs allowed |
+| `message` | string | yes | 1–4000 characters after trimming (unlike `POST chat/{chat_id}/message`, leading and trailing whitespace is removed); newlines and tabs allowed. `text` and `content` are accepted as other names for it; `message` wins if more than one is sent. |
 
 **What happens**, by the state of the pair's DM:
 
@@ -1212,7 +1120,7 @@ keys.
 
 | Status | Code | When |
 | ------ | ---- | ---- |
-| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `message` is missing, not a string, empty after trimming, over 4000 characters, or has a control character |
+| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `message` (or `text`, or `content`) is missing, not a string, empty after trimming, over 4000 characters, or has a control character |
 | 250 | `INVALID_TARGET` | `{user_id}` is you |
 | 253 | `USER_NOT_FOUND` | no such user |
 | 252 | `RATE_LIMITED` | over `MESSAGE_RATE_PER_MINUTE` (every DM counts); when a request would be created (`DM_REQUIRE_ACCEPT=true`), also over `REQUEST_RATE_PER_HOUR` |
@@ -1224,16 +1132,16 @@ keys.
 
 **Pushes**:
 
-* Into an open room: `event/message` to the other person (and to your other connections).
-* New room (the default): `event/chat` (`dm_opened`) to every connection of both of you, this one
-  included (before the reply), then `event/message` with your message to both of you except this
+* Into an open room: `chat/new_message` to the other person (and to your other connections).
+* New room (the default): `chats/new` (`dm_opened`) to every connection of both of you, this one
+  included (before the reply), then `chat/new_message` with your message to both of you except this
   connection. Nothing older is replayed: the room starts with your message. These are the pushes
   the receiver needs to add the DM to their chat list and show the message.
-* A pending request opens (theirs, or a left-over one of yours): `event/chat` (`dm_opened`), then
-  `event/message` with the request's first message, both to every connection of both of you, this
-  one included (here they arrive before the reply); then `event/message` with yours to both of you
-  except this connection; then `event/request` (`accepted`) to them.
-* New request (`DM_REQUIRE_ACCEPT=true`): `event/request` (`pending`) to them, only while the
+* A pending request opens (theirs, or a left-over one of yours): `chats/new` (`dm_opened`), then
+  `chat/new_message` with the request's first message, both to every connection of both of you, this
+  one included (here they arrive before the reply); then `chat/new_message` with yours to both of you
+  except this connection; then `users/request` (`accepted`) to them.
+* New request (`DM_REQUIRE_ACCEPT=true`): `users/request` (`pending`) to them, only while the
   request is still pending (section 4.3).
 
 **Example**. By default the first DM from alice to carol opens the room at once:
@@ -1244,7 +1152,7 @@ keys.
 
 ```json
 {
-  "path": "users/50245c20-966f-4dc8-a71e-dfe2de0d9802/dm",
+  "path": "chats/dm",
   "method": "POST",
   "rid": 7,
   "status": "sent",
@@ -1254,46 +1162,39 @@ keys.
     "kind": "dm",
     "is_dm": true,
     "name": "carol",
+    "pending": false,
     "description": "",
     "role": "member",
     "member_count": 2,
     "unread": 0,
     "last_read_message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
     "last_message": {
-      "message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
+      "id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
       "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
       "kind": "text",
-      "content": "hi carol",
-      "created_at": "2026-11-07T07:22:24.082Z",
-      "sender": {
-        "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hi carol",
+      "time": "2026-11-07T07:22:24.082+00:00",
+      "sender_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+      "sender": "alice"
     },
-    "last_activity": "2026-11-07T07:22:24.082Z",
+    "last_activity": "2026-11-07T07:22:24.082+00:00",
     "peer": {
       "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true
     }
   },
   "messages": [
     {
-      "message_id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
+      "id": "01a1b4e3-17d2-7000-bddb-d8069783aa66",
       "chat_id": "01ffdaf5-1ce5-4fdc-84be-3bb0e251b30b",
       "kind": "text",
-      "content": "hi carol",
-      "created_at": "2026-11-07T07:22:24.082Z",
-      "sender": {
-        "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hi carol",
+      "time": "2026-11-07T07:22:24.082+00:00",
+      "sender_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
+      "sender": "alice"
     }
   ],
   "request": null
@@ -1308,7 +1209,7 @@ With `DM_REQUIRE_ACCEPT=true`, the first DM from alice to bob becomes a request:
 
 ```json
 {
-  "path": "users/4acc2abf-57e9-426d-a52c-90d65a77743b/dm",
+  "path": "chats/dm",
   "method": "POST",
   "rid": 27,
   "status": "pending",
@@ -1323,15 +1224,15 @@ With `DM_REQUIRE_ACCEPT=true`, the first DM from alice to bob becomes a request:
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb"
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB"
     },
-    "created_at": "2026-11-06T14:11:04.757Z",
+    "created_at": "2026-11-06T14:11:04.757+00:00",
     "responded_at": null,
     "message": "hi bob, got a minute?"
   }
@@ -1346,7 +1247,7 @@ After bob accepted, alice writes again and it goes into the room:
 
 ```json
 {
-  "path": "users/4acc2abf-57e9-426d-a52c-90d65a77743b/dm",
+  "path": "chats/dm",
   "method": "POST",
   "rid": 32,
   "status": "sent",
@@ -1356,46 +1257,39 @@ After bob accepted, alice writes again and it goes into the room:
     "kind": "dm",
     "is_dm": true,
     "name": "bob",
+    "pending": false,
     "description": "",
     "role": "member",
     "member_count": 2,
     "unread": 0,
     "last_read_message_id": "01a1b132-e6df-7000-a64f-067660850d0b",
     "last_message": {
-      "message_id": "01a1b132-e6df-7000-a64f-067660850d0b",
+      "id": "01a1b132-e6df-7000-a64f-067660850d0b",
       "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
       "kind": "text",
-      "content": "thanks!",
-      "created_at": "2026-11-06T14:11:05.567Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "thanks!",
+      "time": "2026-11-06T14:11:05.567+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     },
-    "last_activity": "2026-11-06T14:11:05.567Z",
+    "last_activity": "2026-11-06T14:11:05.567+00:00",
     "peer": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb",
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB",
       "online": true
     }
   },
   "messages": [
     {
-      "message_id": "01a1b132-e6df-7000-a64f-067660850d0b",
+      "id": "01a1b132-e6df-7000-a64f-067660850d0b",
       "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
       "kind": "text",
-      "content": "thanks!",
-      "created_at": "2026-11-06T14:11:05.567Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "thanks!",
+      "time": "2026-11-06T14:11:05.567+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     }
   ],
   "request": null
@@ -1411,7 +1305,7 @@ own, which accepts it:
 
 ```json
 {
-  "path": "users/007204d5-49fb-41cc-b93c-593d8380c338/dm",
+  "path": "chats/dm",
   "method": "POST",
   "rid": 39,
   "status": "sent",
@@ -1421,59 +1315,48 @@ own, which accepts it:
     "kind": "dm",
     "is_dm": true,
     "name": "carol",
+    "pending": false,
     "description": "",
     "role": "member",
     "member_count": 2,
     "unread": 0,
     "last_read_message_id": "01a1b132-ea0e-7000-b9bd-9c36ac677b1e",
     "last_message": {
-      "message_id": "01a1b132-ea0e-7000-b9bd-9c36ac677b1e",
+      "id": "01a1b132-ea0e-7000-b9bd-9c36ac677b1e",
       "chat_id": "ea89b58e-fc8c-4c78-b69e-b1a0cbd1f937",
       "kind": "text",
-      "content": "hey carol!",
-      "created_at": "2026-11-06T14:11:06.382Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hey carol!",
+      "time": "2026-11-06T14:11:06.382+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     },
-    "last_activity": "2026-11-06T14:11:06.382Z",
+    "last_activity": "2026-11-06T14:11:06.382+00:00",
     "peer": {
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true
     }
   },
   "messages": [
     {
-      "message_id": "01a1b132-e87a-7000-871c-86ce2c21aef3",
+      "id": "01a1b132-e87a-7000-871c-86ce2c21aef3",
       "chat_id": "ea89b58e-fc8c-4c78-b69e-b1a0cbd1f937",
       "kind": "text",
-      "content": "hey alice",
-      "created_at": "2026-11-06T14:11:05.978Z",
-      "sender": {
-        "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
-        "username": "carol",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hey alice",
+      "time": "2026-11-06T14:11:05.978+00:00",
+      "sender_id": "007204d5-49fb-41cc-b93c-593d8380c338",
+      "sender": "carol"
     },
     {
-      "message_id": "01a1b132-ea0e-7000-b9bd-9c36ac677b1e",
+      "id": "01a1b132-ea0e-7000-b9bd-9c36ac677b1e",
       "chat_id": "ea89b58e-fc8c-4c78-b69e-b1a0cbd1f937",
       "kind": "text",
-      "content": "hey carol!",
-      "created_at": "2026-11-06T14:11:06.382Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hey carol!",
+      "time": "2026-11-06T14:11:06.382+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     }
   ],
   "request": {
@@ -1484,16 +1367,16 @@ own, which accepts it:
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:05.978Z",
-    "responded_at": "2026-11-06T14:11:06.381Z",
+    "created_at": "2026-11-06T14:11:05.978+00:00",
+    "responded_at": "2026-11-06T14:11:06.381+00:00",
     "message": "hey alice"
   }
 }
@@ -1503,7 +1386,7 @@ own, which accepts it:
 
 Auth: any member of the group.
 
-**Changed**: the invited user is not added. They get a pending invite (`event/request`) and
+**Changed**: the invited user is not added. They get a pending invite (`users/request`) and
 become a member only when they accept it, or when they join the group by themselves (R10).
 
 **Request**
@@ -1536,12 +1419,12 @@ become a member only when they accept it, or when they join the group by themsel
 | 253 | `NOT_FOUND` | the group was deleted meanwhile |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/request` (`pending`) to the invited user, only while the invite is still
+**Pushes**: `users/request` (`pending`) to the invited user, only while the invite is still
 pending (section 4.3).
 
 The invite ends when the invited user accepts or declines it (section 3.5, 3.6), the inviter
 cancels it (3.7), the invited user joins by themselves (3.11, which accepts it), or the group is
-deleted (the invite disappears without `event/request`).
+deleted (the invite disappears without `users/request`).
 
 **Example**
 
@@ -1551,7 +1434,7 @@ deleted (the invite disappears without `event/request`).
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/invite",
+  "path": "chat/invited",
   "method": "POST",
   "rid": 16,
   "status": "pending",
@@ -1563,142 +1446,81 @@ deleted (the invite disappears without `event/request`).
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:01.910Z",
+    "created_at": "2026-11-06T14:11:01.910+00:00",
     "responded_at": null,
     "chat": {"chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4", "name": "Network Project"}
   }
 }
 ```
 
-### 2.11 `PATCH users/profile/password`: change your password
+### 2.11 `PATCH users/password`: change your password
 
-Auth: yes. Two requests on the same connection.
+Auth: yes. One request. `PATCH users/profile/password` is the same call under its older URL;
+both answer with `path` `profile/password`.
 
-**Changed**: challenge-response (`ChangePasswordFlow` in `socketcord/scram.py`). Step 2 proves the
-current password with a proof that also covers both Diffie-Hellman values and the encrypted new
-verifier, so nobody in the middle can swap them. The change also **replaces the session token**:
-the final reply carries the new one, and every other connection that used the old token is
-logged out.
+**Changed**: **no current password is asked for.** The GUI's pop-up has only New and Confirm, so
+the call takes `new_password` alone and trusts the session: whoever holds a valid session token
+may change the password of that account. The new password travels in the message body as clear
+text, like every other password here. The call does **not** rotate the session token, so the
+caller and its other connections keep working with the token they already have.
 
-**Step 1 request**
-
-| Field | Type | Required | Rules |
-| ----- | ---- | -------- | ----- |
-| `client_nonce` | string | yes | base64 text, 16–128 characters |
-
-**Step 1 reply**: `step` (`"challenge"`), `challenge_id`, `salt` and `iterations` (the current
-password's), `server_nonce`, `expires_in`, `dh_group`, `dh_public` as in register, plus:
-
-| Field | Type | Meaning |
-| ----- | ---- | ------- |
-| `new_salt` | string | base64 of 16 bytes for the new password |
-| `new_iterations` | integer | PBKDF2 rounds for the new password (`SCRAM_ITERATIONS`) |
-
-**Step 2 request**
+**Request**
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
-| `challenge_id` | string | yes | from step 1 |
-| `client_proof` | string | yes | base64 of 32 bytes: proof with the current password over the full AuthMessage |
-| `dh_public` | string | yes | base64 of 256 bytes |
-| `wrapped_verifier` | string | yes | base64 of 64 bytes: the new password's StoredKey ‖ ServerKey, encrypted |
-| `wrap_tag` | string | yes | base64 of 32 bytes |
+| `new_password` | string | yes | 1–256 characters, not trimmed, no control characters — the same rules as `password` in register. Any other field, `password` included, is ignored. |
 
-The AuthMessage holds your `user_id` in lower case with hyphens, as replies write it;
-`ChangePasswordFlow` builds it that way ([PROTOCOL.md](PROTOCOL.md) section 4).
+The server stores PBKDF2-HMAC-SHA256 of it with a **fresh 16-byte salt** and `SCRAM_ITERATIONS`
+rounds, in one transaction that also checks that the account's stored hash and session are still
+the ones this request read. The old password stops working at once, everywhere.
 
-**Step 2 reply**
+**Reply** (`path`: `profile/password`)
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `step` | string | `"done"` |
 | `user_id` | string | your account |
-| `session_token` | string | the account's **new** session token. Put it in the header from now on (`RequestCord.set_auth(user_id, session_token)`). |
-| `expires_at` | timestamp | when the new session ends (`SESSION_TTL_HOURS` after the change) |
-| `logged_out_connections` | integer | how many other connections used the old token and were logged out |
-| `server_signature` | string | base64 of 32 bytes, made with the old password's ServerKey; `ChangePasswordFlow.verify(reply)` checks it |
+| `changed` | boolean | always `true` |
 
-The old token keeps working **on this connection only, for 30 seconds**, so requests sent before
-the reply arrived still go through. Everywhere else it stops at once.
+There is no `session_token` in this reply: the old one is still the right one.
 
-**Errors**. Failures answer 252, not 251, because the session is still valid. The one 251,
-`INVALID_SESSION`, means the session is gone:
+**Errors**
 
 | Status | Code | When |
 | ------ | ---- | ---- |
-| 250 | `PLAINTEXT_PASSWORD` | the message has `password`, `old_password` or `new_password` |
-| 252 | `TOO_MANY_ATTEMPTS` | step 1: this address asked for too many challenges; step 1 or 2: too many failed password checks for this account from this address (section 1.7); `retry_after` |
-| 250 | `MISSING_FIELD`, `INVALID_FIELD` | a field is missing or malformed |
-| 252 | `CHALLENGE_INVALID` | step 2: the challenge is unknown, used, expired, from another connection, or from an earlier session of this account; or the password was changed in between ("start again") |
-| 252 | `INVALID_CREDENTIALS` | step 2: the current password is wrong |
-| 250 | `INVALID_PROOF` | step 2: the encrypted new verifier failed its integrity check |
-| 251 | `INVALID_SESSION` | step 2: the session ended while the change ran (a logout, or a login elsewhere); or the change went through, but a login with the new password replaced the new session at that same moment |
-| 250 | `CONNECTION_CLOSED` | step 1: the connection closed while the challenge was being made, so none was kept; nobody reads this reply |
+| 250 | `MISSING_FIELD`, `INVALID_FIELD` | `new_password` is missing, not a string, empty, longer than 256 characters, or has a control character |
+| 251 | `INVALID_SESSION` | the session ended while the change ran (a logout, or a login elsewhere); log in again |
+| 252 | `TRY_AGAIN` | another connection of this account changed the password at the same moment; read the state and try again |
 | | common errors | section 1.5 |
 
-After any step-2 error, start again with a new `ChangePasswordFlow`.
+**Pushes**: none. Other devices are not logged out and are not told, because the session token
+did not change; they keep working until the next login somewhere else ends the session.
 
-**Pushes** (step 2): `event/session_revoked` with reason `password_changed` to every other
-connection that used the old token.
-
-**Example** (with credentials). Step 1:
+**Example** (with credentials)
 
 ```json
-{"rid": 15, "client_nonce": "VlG5TGjc/42L20yPa9XnNQby"}
+{"rid": 4, "new_password": "a new one"}
 ```
 
 ```json
 {
-  "path": "users/profile/password",
+  "path": "profile/password",
   "method": "PATCH",
-  "rid": 15,
-  "step": "challenge",
-  "challenge_id": "59effda0-51fe-4e62-b56f-edce74fb9ed0",
-  "salt": "D9YAbW+LifqfEFyx/6sprg==",
-  "iterations": 600000,
-  "server_nonce": "U/In2VAJ+K2yRkg1xwFafRmg",
-  "expires_in": 60,
-  "dh_group": "modp2048",
-  "dh_public": "2/bwyxKLzRVkYKhr...5A6KTA==",
-  "new_salt": "Nx4xKCRFMb/5icnO3ZTFaw==",
-  "new_iterations": 600000
+  "rid": 4,
+  "user_id": "5e3aa6d9-8936-40ff-b9ee-c3278968b871",
+  "changed": true
 }
 ```
 
-Step 2:
-
-```json
-{
-  "rid": 16,
-  "challenge_id": "59effda0-51fe-4e62-b56f-edce74fb9ed0",
-  "dh_public": "hFpEm94aN5thnnfl...oTSTzQ==",
-  "wrapped_verifier": "mz/Y+1yavemQYHhv...LCkZiQ==",
-  "wrap_tag": "S+J1ybl8uqrqmCHPNPeiZTol4jos16QXBC/QAu4F/oY=",
-  "client_proof": "uWwlLLzo4Qw4q14txQFsXfij6HuV3awZ1sE1kWOoM5U="
-}
-```
-
-```json
-{
-  "path": "users/profile/password",
-  "method": "PATCH",
-  "rid": 16,
-  "step": "done",
-  "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
-  "session_token": "f5bbc395-c838-4367-910f-0845861df3d7",
-  "expires_at": "2026-11-13T14:11:10.512Z",
-  "logged_out_connections": 1,
-  "server_signature": "ZbyCNY96LZel9M/DJ7XkvbdZHIcqQCBSNlxDIezqKO0="
-}
-```
+After this, `POST users/login` with the new password works and the old one answers
+`251 INVALID_CREDENTIALS`.
 
 ---
 
@@ -1726,14 +1548,14 @@ logged out too, but the socket stays open, so you can log in again on it or clos
 
 **Errors**: common errors only.
 
-**Pushes**: `event/session_revoked` with reason `logged_out` to every other connection that used
-the same token; `event/presence` (offline) to everyone else at once, if the account has no
+**Pushes**: `login/revoked` with reason `logged_out` to every other connection that used
+the same token; `users/status` (offline) to everyone else at once, if the account has no
 logged-in connection left.
 
 **Example**: `POST users/logout` with an empty message:
 
 ```json
-{"path": "users/logout", "method": "POST", "rid": 46, "logged_out": true}
+{"path": "login/logout", "method": "POST", "rid": 46, "logged_out": true}
 ```
 
 ### 3.2 `GET users/online`: who is online
@@ -1748,7 +1570,7 @@ Auth: yes. Course requirement R4: the list includes you.
 | ----- | ---- | ------- |
 | `count` | integer | number of entries |
 | `users` | list | every account with a logged-in connection, sorted by username ignoring case; each is a User without `created_at`, plus `is_self` (boolean). Someone who lost their last connection less than 2 s ago is still listed. |
-| `presence_seq` | integer | the `seq` of the newest `event/presence` sent so far; ignore any `event/presence` whose `seq` is not greater |
+| `presence_seq` | integer | the `seq` of the newest `users/status` sent so far; ignore any `users/status` whose `seq` is not greater |
 
 **Errors**: common errors only. **Pushes**: none.
 
@@ -1765,15 +1587,15 @@ Auth: yes. Course requirement R4: the list includes you.
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true,
       "is_self": true
     },
     {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb",
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB",
       "online": true,
       "is_self": false
     },
@@ -1781,7 +1603,7 @@ Auth: yes. Course requirement R4: the list includes you.
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true,
       "is_self": false
     }
@@ -1831,8 +1653,8 @@ Auth: yes. Finds anyone with an account, online or not, for example to invite th
     {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb",
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB",
       "online": true,
       "is_self": false
     }
@@ -1876,15 +1698,15 @@ setting was lowered or turned off, or when several requests were sent at the sam
         "user_id": "21381bcb-f07d-4310-9e63-353629ac9fef",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
+        "background": "#F2F2F2"
       },
       "to": {
         "user_id": "fd507003-8c4e-4d14-a2b6-56650d0e04c9",
         "username": "bob",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
+        "background": "#F2F2F2"
       },
-      "created_at": "2026-11-06T14:11:25.032Z",
+      "created_at": "2026-11-06T14:11:25.032+00:00",
       "responded_at": null,
       "message": "hi bob, got a minute?"
     },
@@ -1896,15 +1718,15 @@ setting was lowered or turned off, or when several requests were sent at the sam
         "user_id": "06917463-4dec-44d8-a06f-67a413b75628",
         "username": "carol",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
+        "background": "#F2F2F2"
       },
       "to": {
         "user_id": "fd507003-8c4e-4d14-a2b6-56650d0e04c9",
         "username": "bob",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
+        "background": "#F2F2F2"
       },
-      "created_at": "2026-11-06T14:11:25.033Z",
+      "created_at": "2026-11-06T14:11:25.033+00:00",
       "responded_at": null,
       "chat": {"chat_id": "00a342ef-338e-4da6-bae3-8af0deed368e", "name": "Lab 7"}
     }
@@ -1944,12 +1766,12 @@ message, so the history from before you joined is not unread.
 
 **Pushes**:
 
-* DM request: `event/chat` (`dm_opened`), then `event/message` with the first message, both to
+* DM request: `chats/new` (`dm_opened`), then `chat/new_message` with the first message, both to
   every connection of both people, this one included (here they arrive before the reply); then
-  `event/request` (`accepted`) to the sender.
-* Invite: `event/message` (the system line) to every online member except this connection (your
+  `users/request` (`accepted`) to the sender.
+* Invite: `chat/new_message` (the system line) to every online member except this connection (your
   other connections get it; the reply carries the line as `chat.last_message`),
-  `event/group_updated` (`joined`) to everyone, this connection included, and `event/request`
+  `chat/members_changed` (`joined`) to everyone, this connection included, and `users/request`
   (`accepted`) to the inviter.
 
 **Example**: bob accepts alice's DM request (`POST users/requests/99b362bb-971b-4f39-a15a-b95612bcd979/accept`):
@@ -1967,16 +1789,16 @@ message, so the history from before you joined is not unread.
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb"
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB"
     },
-    "created_at": "2026-11-06T14:11:04.757Z",
-    "responded_at": "2026-11-06T14:11:05.164Z",
+    "created_at": "2026-11-06T14:11:04.757+00:00",
+    "responded_at": "2026-11-06T14:11:05.164+00:00",
     "message": "hi bob, got a minute?"
   },
   "chat": {
@@ -1984,30 +1806,27 @@ message, so the history from before you joined is not unread.
     "kind": "dm",
     "is_dm": true,
     "name": "alice",
+    "pending": false,
     "description": "",
     "role": "member",
     "member_count": 2,
     "unread": 1,
     "last_read_message_id": null,
     "last_message": {
-      "message_id": "01a1b132-e3b5-7000-8839-be47fdf56d69",
+      "id": "01a1b132-e3b5-7000-8839-be47fdf56d69",
       "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
       "kind": "text",
-      "content": "hi bob, got a minute?",
-      "created_at": "2026-11-06T14:11:04.757Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hi bob, got a minute?",
+      "time": "2026-11-06T14:11:04.757+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     },
-    "last_activity": "2026-11-06T14:11:04.757Z",
+    "last_activity": "2026-11-06T14:11:04.757+00:00",
     "peer": {
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true
     }
   }
@@ -2035,7 +1854,7 @@ the sender may send a new one later.
 
 **Errors**: as for accept (`253 REQUEST_NOT_FOUND`, `252 REQUEST_CLOSED`); common errors.
 
-**Pushes**: `event/request` (`declined`) to the sender.
+**Pushes**: `users/request` (`declined`) to the sender.
 
 **Example**: bob declines a DM request from dave:
 
@@ -2052,16 +1871,16 @@ the sender may send a new one later.
       "user_id": "cd952df1-fa2b-4930-b3b4-9f0c397e4fca",
       "username": "dave",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb"
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB"
     },
-    "created_at": "2026-11-06T14:11:07.226Z",
-    "responded_at": "2026-11-06T14:11:07.227Z",
+    "created_at": "2026-11-06T14:11:07.226+00:00",
+    "responded_at": "2026-11-06T14:11:07.227+00:00",
     "message": "hi"
   }
 }
@@ -2085,7 +1904,7 @@ Auth: the sender (`from`) of the request.
 declined, cancelled or deleted with its group); `252 REQUEST_CLOSED` (already accepted); common
 errors.
 
-**Pushes**: `event/request` (`cancelled`) to the receiver.
+**Pushes**: `users/request` (`cancelled`) to the receiver.
 
 **Example**: dave cancels his DM request to carol:
 
@@ -2102,16 +1921,16 @@ errors.
       "user_id": "cd952df1-fa2b-4930-b3b4-9f0c397e4fca",
       "username": "dave",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:07.634Z",
-    "responded_at": "2026-11-06T14:11:07.634Z",
+    "created_at": "2026-11-06T14:11:07.634+00:00",
+    "responded_at": "2026-11-06T14:11:07.634+00:00",
     "message": "yo"
   }
 }
@@ -2143,7 +1962,7 @@ Auth: yes. Course requirement R8: the new group has only its creator as a member
 | 252 | `RATE_LIMITED` | more than `GROUP_CREATE_PER_HOUR` (every new group is pushed to everyone online) |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/group_created` to every logged-in connection except this one.
+**Pushes**: `chats/group_created` to every logged-in connection except this one.
 
 **Example**
 
@@ -2153,7 +1972,7 @@ Auth: yes. Course requirement R8: the new group has only its creator as a member
 
 ```json
 {
-  "path": "chats",
+  "path": "chats/created",
   "method": "POST",
   "rid": 10,
   "chat": {
@@ -2161,13 +1980,14 @@ Auth: yes. Course requirement R8: the new group has only its creator as a member
     "kind": "group",
     "is_dm": false,
     "name": "Network Project",
+    "pending": false,
     "description": "term project",
     "role": "owner",
     "member_count": 1,
     "unread": 0,
     "last_read_message_id": null,
     "last_message": null,
-    "last_activity": "2026-11-06T14:11:00.277Z"
+    "last_activity": "2026-11-06T14:11:00.277+00:00"
   },
   "group": {
     "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
@@ -2175,12 +1995,12 @@ Auth: yes. Course requirement R8: the new group has only its creator as a member
     "is_dm": false,
     "name": "Network Project",
     "description": "term project",
-    "created_at": "2026-11-06T14:11:00.277Z",
+    "created_at": "2026-11-06T14:11:00.277+00:00",
     "created_by": {
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "member_count": 1,
     "online_count": 1,
@@ -2189,9 +2009,9 @@ Auth: yes. Course requirement R8: the new group has only its creator as a member
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "owner",
-        "joined_at": "2026-11-06T14:11:00.277Z",
+        "joined_at": "2026-11-06T14:11:00.277+00:00",
         "online": true
       }
     ],
@@ -2238,12 +2058,12 @@ A group always has at least one member: it is deleted when its last member leave
       "is_dm": false,
       "name": "Network Project",
       "description": "term project",
-      "created_at": "2026-11-06T14:11:00.277Z",
+      "created_at": "2026-11-06T14:11:00.277+00:00",
       "created_by": {
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
+        "background": "#F2F2F2"
       },
       "member_count": 1,
       "online_count": 1,
@@ -2252,9 +2072,9 @@ A group always has at least one member: it is deleted when its last member leave
           "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
           "username": "alice",
           "text_color": "#171717",
-          "text_bg_color": "#f2f2f2",
+          "background": "#F2F2F2",
           "role": "owner",
-          "joined_at": "2026-11-06T14:11:00.277Z",
+          "joined_at": "2026-11-06T14:11:00.277+00:00",
           "online": true
         }
       ],
@@ -2275,14 +2095,14 @@ Auth: members only.
 
 | Field | Type | Required | Rules |
 | ----- | ---- | -------- | ----- |
-| `message_id` | string | no | UUID of the newest message you have seen; default: the chat's newest message |
+| `message_id` | string | no | UUID of the newest message you have seen; default: the chat's newest message. `id` (the message's own field name) is accepted as well. |
 
 **Effect**: your read marker moves forward to the newest message of this chat whose id is at or
 below `message_id` (without `message_id`: the chat's newest message). The marker is therefore
 always a message of this chat: an id from another chat, or one that is no message at all, marks
 this chat's messages up to that id as read and does not become the marker itself. The marker
 never moves back: if that message is older than your marker, nothing changes. `unread` in
-`GET chats` and `first_unread_message_id` count from this marker.
+`GET chats` and `first_unread_id` count from this marker.
 
 **Reply**
 
@@ -2297,7 +2117,7 @@ never moves back: if that message is older than your marker, nothing changes. `u
 | ------ | ---- | ---- |
 | 253 | `CHAT_NOT_FOUND` | no such chat, or a DM you are not in |
 | 252 | `NOT_A_MEMBER` | a group you have not joined |
-| 250 | `INVALID_FIELD` | `message_id` is not a UUID |
+| 250 | `INVALID_FIELD` | `message_id` (or `id`) is not a UUID |
 | | common errors | section 1.5 |
 
 **Pushes**: none. Your other connections are not told; their `GET chats` shows the new counts.
@@ -2310,7 +2130,7 @@ never moves back: if that message is older than your marker, nothing changes. `u
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/read",
+  "path": "chat/read",
   "method": "POST",
   "rid": 19,
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
@@ -2346,10 +2166,10 @@ Auth: yes. Course requirement R10: a client joins a group by itself.
 | 253 | `NOT_FOUND` | the group was deleted meanwhile |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/message` (the system line) to every online member except this connection (your
+**Pushes**: `chat/new_message` (the system line) to every online member except this connection (your
 other connections get it; the reply carries the line as `chat.last_message`);
-`event/group_updated` (`joined`) to everyone, this connection included (it arrives just before
-the reply); and `event/request` (`accepted`) to the inviter if a pending invite was settled.
+`chat/members_changed` (`joined`) to everyone, this connection included (it arrives just before
+the reply); and `users/request` (`accepted`) to the inviter if a pending invite was settled.
 
 **Example**: bob joins alice's group:
 
@@ -2363,20 +2183,22 @@ the reply); and `event/request` (`accepted`) to the inviter if a pending invite 
     "kind": "group",
     "is_dm": false,
     "name": "Network Project",
+    "pending": false,
     "description": "term project",
     "role": "member",
     "member_count": 2,
     "unread": 0,
     "last_read_message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
     "last_message": {
-      "message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
+      "id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
       "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
       "kind": "system",
-      "content": "bob joined the group",
-      "created_at": "2026-11-06T14:11:00.684Z",
+      "text": "bob joined the group",
+      "time": "2026-11-06T14:11:00.684+00:00",
+      "sender_id": null,
       "sender": null
     },
-    "last_activity": "2026-11-06T14:11:00.684Z"
+    "last_activity": "2026-11-06T14:11:00.684+00:00"
   },
   "info": {
     "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
@@ -2388,9 +2210,9 @@ the reply); and `event/request` (`accepted`) to the inviter if a pending invite 
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:00.277Z",
+    "created_at": "2026-11-06T14:11:00.277+00:00",
     "member_count": 2,
     "online_count": 2,
     "members": [
@@ -2398,18 +2220,18 @@ the reply); and `event/request` (`accepted`) to the inviter if a pending invite 
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "owner",
-        "joined_at": "2026-11-06T14:11:00.277Z",
+        "joined_at": "2026-11-06T14:11:00.277+00:00",
         "online": true
       },
       {
         "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
         "username": "bob",
-        "text_color": "#ffffff",
-        "text_bg_color": "#1f6feb",
+        "text_color": "#FFFFFF",
+        "background": "#1F6FEB",
         "role": "member",
-        "joined_at": "2026-11-06T14:11:00.684Z",
+        "joined_at": "2026-11-06T14:11:00.684+00:00",
         "online": true
       }
     ],
@@ -2452,10 +2274,10 @@ again.
 | 252 | `RATE_LIMITED` | more than `MEMBERSHIP_RATE_PER_MINUTE` joins and leaves |
 | | common errors | section 1.5 |
 
-**Pushes**: if the group was deleted, `event/group_deleted` to everyone (you included).
-Otherwise `event/message` (the system line) to the remaining online members and
-`event/group_updated` (`left`) to everyone, you included. Pending invites of a deleted group
-disappear without `event/request`.
+**Pushes**: if the group was deleted, `chats/group_deleted` to everyone (you included).
+Otherwise `chat/new_message` (the system line) to the remaining online members and
+`chat/members_changed` (`left`) to everyone, you included. Pending invites of a deleted group
+disappear without `users/request`.
 
 **Example**
 
@@ -2545,7 +2367,7 @@ A reply written by Claude:
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/summary",
+  "path": "chat/summary",
   "method": "GET",
   "rid": 31,
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
@@ -2556,8 +2378,8 @@ A reply written by Claude:
   "omitted": 0,
   "first_message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
   "last_message_id": "01a1b132-da2d-7000-9580-a1c0b24aabab",
-  "from_time": "2026-11-06T14:11:00.684Z",
-  "to_time": "2026-11-06T14:11:02.317Z",
+  "from_time": "2026-11-06T14:11:00.684+00:00",
+  "to_time": "2026-11-06T14:11:02.317+00:00",
   "has_more": false,
   "engine": "claude",
   "model": "claude-opus-5-5",
@@ -2570,7 +2392,7 @@ The same request on a server without an API key (offline engine):
 
 ```json
 {
-  "path": "chat/ce90105a-ad2f-4914-97bf-37aa3e306db4/summary",
+  "path": "chat/summary",
   "method": "GET",
   "rid": 31,
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
@@ -2581,8 +2403,8 @@ The same request on a server without an API key (offline engine):
   "omitted": 0,
   "first_message_id": "01a1b132-d3cc-7000-8d75-cf656ede128e",
   "last_message_id": "01a1b132-da2d-7000-9580-a1c0b24aabab",
-  "from_time": "2026-11-06T14:11:00.684Z",
-  "to_time": "2026-11-06T14:11:02.317Z",
+  "from_time": "2026-11-06T14:11:00.684+00:00",
+  "to_time": "2026-11-06T14:11:02.317+00:00",
   "has_more": false,
   "engine": "offline",
   "model": null,
@@ -2595,7 +2417,7 @@ Nothing to summarize (`"unread"` with no unread messages):
 
 ```json
 {
-  "path": "chat/d3e539df-54fd-434c-82fe-c0fcb466cf9f/summary",
+  "path": "chat/summary",
   "method": "GET",
   "rid": 6,
   "chat_id": "d3e539df-54fd-434c-82fe-c0fcb466cf9f",
@@ -2650,14 +2472,14 @@ An entry of `groups`:
 | 253 | `NOT_FOUND` | `{user_id}` is not a UUID ("no such call") |
 | | common errors | section 1.5 |
 
-**Pushes**: none. Keep a shown list current with `event/group_updated` (`joined` / `left`, whose
-`user` is that user) and `event/group_deleted`, or ask again.
+**Pushes**: none. Keep a shown list current with `chat/members_changed` (`joined` / `left`, whose
+`user` is that user) and `chats/group_deleted`, or ask again.
 
 **Example**: carol asks for alice's groups:
 
 ```json
 {
-  "path": "users/a5a12c62-a12b-4c9c-aa45-4e2fad035b70/groups",
+  "path": "users/groups",
   "method": "GET",
   "rid": 6,
   "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
@@ -2665,7 +2487,7 @@ An entry of `groups`:
     "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
     "username": "alice",
     "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
+    "background": "#F2F2F2",
     "online": true
   },
   "count": 2,
@@ -2676,10 +2498,10 @@ An entry of `groups`:
       "is_dm": false,
       "name": "Book Club",
       "description": "",
-      "created_at": "2026-11-07T07:22:24.080Z",
+      "created_at": "2026-11-07T07:22:24.080+00:00",
       "member_count": 1,
       "role": "owner",
-      "joined_at": "2026-11-07T07:22:24.080Z",
+      "joined_at": "2026-11-07T07:22:24.080+00:00",
       "joined": false
     },
     {
@@ -2688,10 +2510,10 @@ An entry of `groups`:
       "is_dm": false,
       "name": "Network Project",
       "description": "term project",
-      "created_at": "2026-11-07T07:22:24.080Z",
+      "created_at": "2026-11-07T07:22:24.080+00:00",
       "member_count": 2,
       "role": "owner",
-      "joined_at": "2026-11-07T07:22:24.080Z",
+      "joined_at": "2026-11-07T07:22:24.080+00:00",
       "joined": false
     }
   ]
@@ -2726,7 +2548,7 @@ Sorted by username without regard to case; at most 50 people.
 | `chat_id` | string | the group |
 | `query` | string | the query as used (trimmed) |
 | `count` | integer | number of entries in `users` |
-| `users` | list | each `{"user_id", "username", "text_color", "text_bg_color", "online"}` (a User without `created_at`); at most 50 |
+| `users` | list | each `{"user_id", "username", "text_color", "background", "online"}` (a User without `created_at`); at most 50 |
 
 **Errors**, checked in this order:
 
@@ -2762,14 +2584,14 @@ are online:
       "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true
     },
     {
       "user_id": "c2cd251f-8294-4fd9-ba19-0601dcd08fdd",
       "username": "dave",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2",
+      "background": "#F2F2F2",
       "online": true
     }
   ]
@@ -2821,16 +2643,16 @@ is not unread.
 | 253 | `NOT_FOUND` | `{chat_id}` is not a UUID ("no such call"), or the group was deleted meanwhile |
 | | common errors | section 1.5 |
 
-**Pushes**: the same as accepting an invite in section 3.5: `event/message` (the system line) to
-every online member except this connection, `event/group_updated` (`joined`) to everyone, this
-connection included, and `event/request` (`accepted`) to the inviter.
+**Pushes**: the same as accepting an invite in section 3.5: `chat/new_message` (the system line) to
+every online member except this connection, `chat/members_changed` (`joined`) to everyone, this
+connection included, and `users/request` (`accepted`) to the inviter.
 
 **Example**: carol accepts alice's invite to "Network Project"
 (`POST chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invite/accept`, empty message):
 
 ```json
 {
-  "path": "chat/50899369-a177-46e6-8cd5-1bb6da9c2030/invite/accept",
+  "path": "chat/joined",
   "method": "POST",
   "rid": 7,
   "chat": {
@@ -2838,20 +2660,22 @@ connection included, and `event/request` (`accepted`) to the inviter.
     "kind": "group",
     "is_dm": false,
     "name": "Network Project",
+    "pending": false,
     "description": "term project",
     "role": "member",
     "member_count": 3,
     "unread": 0,
     "last_read_message_id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
     "last_message": {
-      "message_id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
+      "id": "01a1b4e3-17e5-7000-8a61-735f1072fb12",
       "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
       "kind": "system",
-      "content": "carol joined the group",
-      "created_at": "2026-11-07T07:22:24.101Z",
+      "text": "carol joined the group",
+      "time": "2026-11-07T07:22:24.101+00:00",
+      "sender_id": null,
       "sender": null
     },
-    "last_activity": "2026-11-07T07:22:24.101Z"
+    "last_activity": "2026-11-07T07:22:24.101+00:00"
   },
   "info": {
     "chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030",
@@ -2863,9 +2687,9 @@ connection included, and `event/request` (`accepted`) to the inviter.
       "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-07T07:22:24.080Z",
+    "created_at": "2026-11-07T07:22:24.080+00:00",
     "member_count": 3,
     "online_count": 3,
     "members": [
@@ -2873,27 +2697,27 @@ connection included, and `event/request` (`accepted`) to the inviter.
         "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "owner",
-        "joined_at": "2026-11-07T07:22:24.080Z",
+        "joined_at": "2026-11-07T07:22:24.080+00:00",
         "online": true
       },
       {
         "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
         "username": "Bobby",
-        "text_color": "#ffffff",
-        "text_bg_color": "#1f6feb",
+        "text_color": "#FFFFFF",
+        "background": "#1F6FEB",
         "role": "member",
-        "joined_at": "2026-11-07T07:22:24.081Z",
+        "joined_at": "2026-11-07T07:22:24.081+00:00",
         "online": true
       },
       {
         "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
         "username": "carol",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "member",
-        "joined_at": "2026-11-07T07:22:24.101Z",
+        "joined_at": "2026-11-07T07:22:24.101+00:00",
         "online": true
       }
     ],
@@ -2912,16 +2736,16 @@ connection included, and `event/request` (`accepted`) to the inviter.
       "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "50245c20-966f-4dc8-a71e-dfe2de0d9802",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-07T07:22:24.101Z",
-    "responded_at": "2026-11-07T07:22:24.101Z",
+    "created_at": "2026-11-07T07:22:24.101+00:00",
+    "responded_at": "2026-11-07T07:22:24.101+00:00",
     "chat": {"chat_id": "50899369-a177-46e6-8cd5-1bb6da9c2030", "name": "Network Project"}
   }
 }
@@ -2967,13 +2791,13 @@ the group's `chat_id`.
 | 253 | `NOT_FOUND` | `{chat_id}` is not a UUID ("no such call") |
 | | common errors | section 1.5 |
 
-**Pushes**: `event/request` (`declined`) to the inviter.
+**Pushes**: `users/request` (`declined`) to the inviter.
 
 **Example**: dave declines alice's invite to "Book Club":
 
 ```json
 {
-  "path": "chat/d423ebd8-5858-48d3-a1f7-878576ba8aaf/invite/reject",
+  "path": "chat/declined",
   "method": "POST",
   "rid": 5,
   "chat_id": "d423ebd8-5858-48d3-a1f7-878576ba8aaf",
@@ -2986,16 +2810,16 @@ the group's `chat_id`.
       "user_id": "a5a12c62-a12b-4c9c-aa45-4e2fad035b70",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "c2cd251f-8294-4fd9-ba19-0601dcd08fdd",
       "username": "dave",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-07T07:22:24.102Z",
-    "responded_at": "2026-11-07T07:22:24.102Z",
+    "created_at": "2026-11-07T07:22:24.102+00:00",
+    "responded_at": "2026-11-07T07:22:24.102+00:00",
     "chat": {"chat_id": "d423ebd8-5858-48d3-a1f7-878576ba8aaf", "name": "Book Club"}
   }
 }
@@ -3017,21 +2841,38 @@ Again, with nothing left to decline:
 
 ## 4. Server pushes
 
-A push is a reply packet nobody asked for: status 200, `path` = `event/<name>`, and no `method`
-or `rid`. Pushes go only to logged-in connections. In this section:
+A push is a reply packet nobody asked for: status 200, one of the nine `path` values below, and
+**no `method` and no `rid`** — `"method" not in reply` is the test for "this is a push", and the
+same list is `PUSH_PATHS` in `socketcord/protocol.py`. No push path is ever a request URL, so a
+client may also route on `path` alone. Pushes go only to logged-in connections.
+
+| `path` | When | Payload | Section |
+| ------ | ---- | ------- | ------- |
+| `chat/new_message` | somebody posted in a chat you are in | `chat_id`, `message` | 4.1 |
+| `users/status` | somebody went online or offline | `user_id`, `online`, `user`, `seq` | 4.2 |
+| `users/request` | a DM request or an invitation was made or answered | `request` | 4.3 |
+| `chats/new` | you were invited to a group, or a DM was opened with you | `chat` | 4.4 |
+| `chats/group_created` | a new group exists | `group` | 4.5 |
+| `chat/members_changed` | a member joined, left, renamed or changed colours, or your invitation was cancelled | `chat_id`, `change` | 4.6 |
+| `chats/group_deleted` | a group's last member left | `chat_id` | 4.7 |
+| `users/profile_changed` | somebody changed their username or colours | `user` | 4.8 |
+| `login/revoked` | your session ended somewhere else | `reason` | 4.9 |
+
+The first four are the ones contract v2 names; the other five are the extra ones the GUI needs,
+under the same naming style. In this section:
 
 * "everyone" means every logged-in connection on the server;
 * "not to the acting connection" means the connection whose request caused the push does not get
   it, while that user's other connections do.
 
 Pushes about one chat leave the server in the order the changes were committed. For example,
-`event/group_created` comes before any `event/message` or `event/group_updated` of that group,
-and a `"pending"` `event/request` never arrives after a newer state of the same request. On the
+`chats/group_created` comes before any `chat/new_message` or `chat/members_changed` of that group,
+and a `"pending"` `users/request` never arrives after a newer state of the same request. On the
 connection that made a call, the pushes that call causes for that connection arrive before its
 reply. A client that stops reading is disconnected once more than 8 MB of pushes wait for it
 ([PROTOCOL.md](PROTOCOL.md) section 1).
 
-### 4.1 `event/message`: a new message in a chat
+### 4.1 `chat/new_message`: a new message in a chat
 
 **When**: a message is stored: `POST chat/{chat_id}/message`, `POST users/{user_id}/dm` into a
 room, the system lines of joining and leaving, and, when a DM room opens, the first message that
@@ -3045,7 +2886,7 @@ the DM request carried.
 * a leave line goes to the members who remain, so none of the leaver's connections get it.
 
 When a DM request is accepted, its first message goes to every connection of both people, the
-acting connection included, right after `event/chat`.
+acting connection included, right after `chats/new`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -3055,26 +2896,22 @@ acting connection included, right after `event/chat`.
 
 ```json
 {
-  "path": "event/message",
+  "path": "chat/new_message",
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
   "chat_kind": "group",
   "message": {
-    "message_id": "01a1b132-d564-7000-8685-b94d127a7451",
+    "id": "01a1b132-d564-7000-8685-b94d127a7451",
     "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
     "kind": "text",
-    "content": "hello group",
-    "created_at": "2026-11-06T14:11:01.092Z",
-    "sender": {
-      "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-      "username": "alice",
-      "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
-    }
+    "text": "hello group",
+    "time": "2026-11-06T14:11:01.092+00:00",
+    "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+    "sender": "alice"
   }
 }
 ```
 
-### 4.2 `event/presence`: someone came online or went offline
+### 4.2 `users/status`: someone came online or went offline
 
 **When**:
 
@@ -3088,41 +2925,44 @@ acting connection included, right after `event/chat`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `user` | User without `created_at` | `online` in it equals the field below |
+| `user_id` | string | who it is about (contract v2 section 4) |
 | `online` | boolean | |
+| `user` | User without `created_at` | the same person as one object, with their current name and colours (`online` in it equals the field above); use it to add somebody to the online list without another call |
 | `seq` | integer | grows by one with every presence push, server-wide (it starts again at 1 when the server restarts). Ignore a push whose `seq` is not greater than the newest you have, including `presence_seq` of `GET users/online`. |
 
 ```json
 {
-  "path": "event/presence",
+  "path": "users/status",
+  "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
+  "online": true,
   "user": {
     "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
     "username": "bob",
     "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
+    "background": "#F2F2F2",
     "online": true
   },
-  "online": true,
   "seq": 2
 }
 ```
 
 ```json
 {
-  "path": "event/presence",
+  "path": "users/status",
+  "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+  "online": false,
   "user": {
     "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
     "username": "alice",
     "text_color": "#171717",
-    "text_bg_color": "#f2f2f2",
+    "background": "#F2F2F2",
     "online": false
   },
-  "online": false,
   "seq": 5
 }
 ```
 
-### 4.3 `event/request`: a DM request or invite was made or answered
+### 4.3 `users/request`: a DM request or invite was made or answered
 
 **To**, by cause (never to the acting connection):
 
@@ -3143,7 +2983,7 @@ The answering user's own other connections are not told. A `"pending"` push is s
 the request is still pending, so it never arrives after a newer state of that request; a request
 that was answered or cancelled at once may never be announced as `"pending"` at all. When a group
 is deleted, its pending invites disappear without this push: drop the invites whose
-`chat.chat_id` arrives in `event/group_deleted`.
+`chat.chat_id` arrives in `chats/group_deleted`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
@@ -3151,7 +2991,7 @@ is deleted, its pending invites disappear without this push: drop the invites wh
 
 ```json
 {
-  "path": "event/request",
+  "path": "users/request",
   "request": {
     "request_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
     "kind": "dm",
@@ -3160,15 +3000,15 @@ is deleted, its pending invites disappear without this push: drop the invites wh
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb"
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB"
     },
-    "created_at": "2026-11-06T14:11:04.757Z",
+    "created_at": "2026-11-06T14:11:04.757+00:00",
     "responded_at": null,
     "message": "hi bob, got a minute?"
   }
@@ -3177,7 +3017,7 @@ is deleted, its pending invites disappear without this push: drop the invites wh
 
 ```json
 {
-  "path": "event/request",
+  "path": "users/request",
   "request": {
     "request_id": "04d5ffc9-faa5-48f3-9d60-3b7a3fdae037",
     "kind": "invite",
@@ -3186,79 +3026,85 @@ is deleted, its pending invites disappear without this push: drop the invites wh
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "to": {
       "user_id": "007204d5-49fb-41cc-b93c-593d8380c338",
       "username": "carol",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
-    "created_at": "2026-11-06T14:11:01.910Z",
-    "responded_at": "2026-11-06T14:11:02.317Z",
+    "created_at": "2026-11-06T14:11:01.910+00:00",
+    "responded_at": "2026-11-06T14:11:02.317+00:00",
     "chat": {"chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4", "name": "Network Project"}
   }
 }
 ```
 
-### 4.4 `event/chat`: a DM room opened
+### 4.4 `chats/new`: a chat joined your list
 
-**When**: the first DM between two people (`POST users/{user_id}/dm` with the default
-`DM_REQUIRE_ACCEPT=false`); or a pending DM request opens: its receiver accepts it or writes back,
-or (with `DM_REQUIRE_ACCEPT=false`) its sender writes again.
+**When**: two cases.
 
-**To**: every logged-in connection of both people, the acting connection included, each person
-with the chat as it appears in their own `GET chats`. It always arrives before the room's first
-`event/message`, so the client knows the `chat_id` first; on the acting connection it also
-arrives before the reply. An accepted DM request's first message follows it as `event/message`.
+1. **A DM opened**: the first DM between two people (`POST users/{user_id}/dm` with the default
+   `DM_REQUIRE_ACCEPT=false`); or a pending DM request opens: its receiver accepts it or writes
+   back, or (with `DM_REQUIRE_ACCEPT=false`) its sender writes again. `reason` is `"dm_opened"`.
+2. **You were invited to a group** (`POST chat/{chat_id}/invite`): the row has `pending`: `true`
+   and there is no `reason`. You are not a member yet; accept it with
+   `POST chat/{chat_id}/invite/accept` (section 3.16) or reject it with `.../invite/reject`. The
+   same row is in `GET chats`, so a client that was offline when the invitation arrived still
+   sees it (section 2.5). `users/request` (section 4.3) carries the same event as a Request
+   object, for clients that work with requests instead of rows.
+
+**To**: for a DM, every logged-in connection of both people, the acting connection included, each
+person with the chat as it appears in their own `GET chats`; for an invitation, every connection
+of the invited person. It always arrives before the room's first `chat/new_message`, so the client
+knows the `chat_id` first; on the acting connection it also arrives before the reply. An accepted
+DM request's first message follows it as `chat/new_message`.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `reason` | string | `"dm_opened"` (the only value) |
-| `chat` | Chat item | |
+| `chat` | Chat item | `pending` is `true` for an invitation, `false` for a DM |
+| `reason` | string | `"dm_opened"` for a DM; absent for an invitation |
 
 alice's copy when bob accepts her DM request (her first message is already read for her):
 
 ```json
 {
-  "path": "event/chat",
+  "path": "chats/new",
   "reason": "dm_opened",
   "chat": {
     "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
     "kind": "dm",
     "is_dm": true,
     "name": "bob",
+    "pending": false,
     "description": "",
     "role": "member",
     "member_count": 2,
     "unread": 0,
     "last_read_message_id": "01a1b132-e3b5-7000-8839-be47fdf56d69",
     "last_message": {
-      "message_id": "01a1b132-e3b5-7000-8839-be47fdf56d69",
+      "id": "01a1b132-e3b5-7000-8839-be47fdf56d69",
       "chat_id": "99b362bb-971b-4f39-a15a-b95612bcd979",
       "kind": "text",
-      "content": "hi bob, got a minute?",
-      "created_at": "2026-11-06T14:11:04.757Z",
-      "sender": {
-        "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
-        "username": "alice",
-        "text_color": "#171717",
-        "text_bg_color": "#f2f2f2"
-      }
+      "text": "hi bob, got a minute?",
+      "time": "2026-11-06T14:11:04.757+00:00",
+      "sender_id": "08d17d12-713f-45c0-986b-46af83c8968d",
+      "sender": "alice"
     },
-    "last_activity": "2026-11-06T14:11:04.757Z",
+    "last_activity": "2026-11-06T14:11:04.757+00:00",
     "peer": {
       "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
       "username": "bob",
-      "text_color": "#ffffff",
-      "text_bg_color": "#1f6feb",
+      "text_color": "#FFFFFF",
+      "background": "#1F6FEB",
       "online": true
     }
   }
 }
 ```
 
-### 4.5 `event/group_created`: a new group
+### 4.5 `chats/group_created`: a new group
 
 **When**: `POST chats`. **To**: everyone except the creating connection.
 
@@ -3268,19 +3114,19 @@ alice's copy when bob accepts her DM request (her first message is already read 
 
 ```json
 {
-  "path": "event/group_created",
+  "path": "chats/group_created",
   "group": {
     "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
     "kind": "group",
     "is_dm": false,
     "name": "Network Project",
     "description": "term project",
-    "created_at": "2026-11-06T14:11:00.277Z",
+    "created_at": "2026-11-06T14:11:00.277+00:00",
     "created_by": {
       "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
       "username": "alice",
       "text_color": "#171717",
-      "text_bg_color": "#f2f2f2"
+      "background": "#F2F2F2"
     },
     "member_count": 1,
     "online_count": 1,
@@ -3289,9 +3135,9 @@ alice's copy when bob accepts her DM request (her first message is already read 
         "user_id": "08d17d12-713f-45c0-986b-46af83c8968d",
         "username": "alice",
         "text_color": "#171717",
-        "text_bg_color": "#f2f2f2",
+        "background": "#F2F2F2",
         "role": "owner",
-        "joined_at": "2026-11-06T14:11:00.277Z",
+        "joined_at": "2026-11-06T14:11:00.277+00:00",
         "online": true
       }
     ],
@@ -3300,25 +3146,35 @@ alice's copy when bob accepts her DM request (her first message is already read 
 }
 ```
 
-### 4.6 `event/group_updated`: someone joined or left a group
+### 4.6 `chat/members_changed`: a chat's people changed
 
-**When**: a join (`POST chat/{chat_id}/join`, or accepting an invite with
-`POST users/requests/{request_id}/accept` or `POST chat/{chat_id}/invite/accept`) or a leave that
-does not delete the group. **To**: everyone, the actor included.
+**When**: four cases, told apart by `change`.
+
+| `change` | When | To |
+| -------- | ---- | -- |
+| `"joined"` | a join: `POST chat/{chat_id}/join`, or accepting an invite with `POST users/requests/{request_id}/accept` or `POST chat/{chat_id}/invite/accept` | everyone, the actor included |
+| `"left"` | `POST chat/{chat_id}/leave`, when the group survives it | everyone, the actor included |
+| `"profile"` | a member renamed themselves or changed their colours (`PATCH users/profile`): the member lists of every chat they are in now show something else | the members of that chat, except the acting connection |
+| `"invite_cancelled"` | your pending invitation to this group is gone: the inviter cancelled it (`POST users/requests/{request_id}/cancel`), or you rejected it on another device | the invited person's connections, except the acting one |
+
+**What the client does with it**: on `"invite_cancelled"`, remove that chat's `pending` row from
+the chat list (the invitation no longer exists; opening it would answer `253 REQUEST_NOT_FOUND`).
+On the other three, re-read the chat's members with `GET chat/{chat_id}/info` if that chat is
+open, and `GET chats` if you want the new `member_count` in the list.
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
 | `chat_id` | string | the group |
-| `name` | string | its name |
-| `member_count` | integer | members after the change |
-| `change` | string | `"joined"` or `"left"` |
-| `user` | User ref | who joined or left |
+| `change` | string | `"joined"`, `"left"`, `"profile"` or `"invite_cancelled"` |
+| `name` | string | its name (`"joined"` and `"left"` only) |
+| `member_count` | integer | members after the change (`"joined"` and `"left"` only) |
+| `user` | User ref | who joined or left (`"joined"` and `"left"` only) |
 
 It is a small change notice, not the member list; fetch `GET chat/{chat_id}/info` for that.
 
 ```json
 {
-  "path": "event/group_updated",
+  "path": "chat/members_changed",
   "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
   "name": "Network Project",
   "member_count": 2,
@@ -3326,13 +3182,18 @@ It is a small change notice, not the member list; fetch `GET chat/{chat_id}/info
   "user": {
     "user_id": "4acc2abf-57e9-426d-a52c-90d65a77743b",
     "username": "bob",
-    "text_color": "#ffffff",
-    "text_bg_color": "#1f6feb"
+    "text_color": "#FFFFFF",
+    "background": "#1F6FEB"
   }
 }
 ```
 
-### 4.7 `event/group_deleted`: a group is gone
+```json
+{"path": "chat/members_changed", "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4",
+ "change": "invite_cancelled"}
+```
+
+### 4.7 `chats/group_deleted`: a group is gone
 
 **When**: its last member left; its messages and pending invites are deleted with it. **To**:
 everyone, the actor included.
@@ -3342,10 +3203,10 @@ everyone, the actor included.
 | `chat_id` | string | the deleted group |
 
 ```json
-{"path": "event/group_deleted", "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4"}
+{"path": "chats/group_deleted", "chat_id": "ce90105a-ad2f-4914-97bf-37aa3e306db4"}
 ```
 
-### 4.8 `event/profile`: someone changed their name or colours
+### 4.8 `users/profile_changed`: someone changed their name or colours
 
 **When**: `PATCH users/profile` (a rename, a colour change, or both). **To**: everyone except the
 acting connection.
@@ -3361,20 +3222,21 @@ alice's copy when bob renames himself to Bobby and changes his colours (section 
 
 ```json
 {
-  "path": "event/profile",
+  "path": "users/profile_changed",
   "user": {
     "user_id": "2fb20bce-8f92-4892-9f7f-4349743f8b95",
     "username": "Bobby",
-    "text_color": "#ffffff",
-    "text_bg_color": "#1f6feb",
+    "text_color": "#FFFFFF",
+    "background": "#1F6FEB",
     "online": true
   }
 }
 ```
 
-### 4.9 `event/session_revoked`: this connection was logged out
+### 4.9 `login/revoked`: this connection was logged out
 
-**When**: the server logs a connection out by itself. The push comes first; then the connection
+**When**: the server logs a connection out by itself. A password change is NOT one of these
+cases: it keeps the session token (section 2.11). The push comes first; then the connection
 is no longer logged in, and its next authenticated request gets `251 INVALID_SESSION`. The socket
 stays open.
 
@@ -3388,15 +3250,14 @@ stays open.
 | -------- | ----- |
 | `logged_in_elsewhere` | the account logged in on another connection (`POST users/login`); an account has one session, so the old token stopped working |
 | `logged_out` | `POST users/logout` on another connection that shared this token |
-| `password_changed` | a password change on another connection replaced the token |
 | `expired` | the session reached its `expires_at` (checked every 5 s, and on each request) |
-| `too_many_connections` | rare: a login found `MAX_CONNECTIONS_PER_USER` connections of the account logged in on a session it was not replacing, and this was the oldest. That can only happen while the account's session changes at that same moment (another login, a logout, a password change). An ordinary login on a sixth connection does not cause it: it replaces the session, and the old connections get `logged_in_elsewhere`. |
+| `too_many_connections` | rare: a login found `MAX_CONNECTIONS_PER_USER` connections of the account logged in on a session it was not replacing, and this was the oldest. That can only happen while the account's session changes at that same moment (another login or a logout). An ordinary login on a sixth connection does not cause it: it replaces the session, and the old connections get `logged_in_elsewhere`. |
 
 Treat every reason as "logged out". After `logged_in_elsewhere`, do not log in again
 automatically: two clients that do would keep logging each other out.
 
 ```json
-{"path": "event/session_revoked", "reason": "logged_in_elsewhere"}
+{"path": "login/revoked", "reason": "logged_in_elsewhere"}
 ```
 
 ---
@@ -3410,14 +3271,18 @@ the client has to do so that the server's view and the GUI agree.
 
 | `chat_page.py` method | Feed it from | Mapping |
 | --------------------- | ------------ | ------- |
-| `set_user_style(username, text_color, background)` | any User, User ref or Member: the login reply's `user`, `members`, message `sender`, `event/profile`, `event/presence` | `(u["username"], u["text_color"], u["text_bg_color"])`. Call it before `set_members` / `set_messages`, since it redraws them. After a rename (`event/profile`) the old name is gone: look the person up by `user_id`. |
+| `set_user_style(username, text_color, background)` | any User, User ref or Member: the login reply's `user`, `members`, message `sender`, `users/profile_changed`, `users/status` | `(u["username"], u["text_color"], u["background"])`. Call it before `set_members` / `set_messages`, since it redraws them. After a rename (`users/profile_changed`) the old name is gone: look the person up by `user_id`. |
 | `set_profile(username)` | the login reply's `user` (or `GET users/info`) | `user["username"]` |
 | `set_chats(chats, selected_id)` | `GET chats` → `chats` | each Chat item already has `chat_id`, `name`, `unread`, `is_dm` and `last_activity`; convert `last_activity` to a `datetime` (below). The GUI adds `[DM]` in front of DM names itself. |
 | `set_members(members)` | `GET chat/{chat_id}/info` → `chat["members"]` | `{"username": m["username"], "online": m["online"], "is_me": m["user_id"] == my_user_id}`. Pending invites (`chat["invited"]`) have no place in the current GUI. |
-| `set_messages(messages, first_unread_id)` | `GET chat/{chat_id}/messages` | `messages` mapped as below; `first_unread_id = reply["first_unread_message_id"]`. The NEW line is drawn only if that message is in the list. |
-| `append_message(message)` | `event/message` for the open chat; the `message` in your own `POST chat/{chat_id}/message` reply | mapped as below; add `"status": "Sent"` to your own |
+| `set_messages(messages, first_unread_id)` | `GET chat/{chat_id}/messages` | `messages` mapped as below; `first_unread_id = reply["first_unread_id"]`. The NEW line is drawn only if that message is in the list. |
+| `append_message(message)` | `chat/new_message` for the open chat; the `message` in your own `POST chat/{chat_id}/message` reply | mapped as below; add `"status": "Sent"` to your own |
 | `set_summary(text)` | `GET chat/{chat_id}/summary` | `reply["summary"]`, or a placeholder such as "Nothing to summarize" when it is `null`; when `engine` is `"offline"` the text says it is not written by AI |
 | `set_chat_title(title)` | Chat item / Chat info | `name` (selecting a chat in the list already sets it) |
+
+Contract v2 spells the message fields the way the GUI wants them, so most of the old adapter
+is gone: `id`, `text`, `time`, `sender`, `sender_id`, `background` need no renaming. What is
+left is parsing the timestamps and marking your own messages.
 
 ```python
 from datetime import datetime
@@ -3425,34 +3290,34 @@ from datetime import datetime
 
 def ts(s):
     """API timestamp -> local datetime, on Python 3.9 and later."""
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone() if s else None
+    return datetime.fromisoformat(s).astimezone() if s else None
 
 
 def chat_row(c):
-    """GET chats item (or event/chat "chat") -> a set_chats() row."""
+    """GET chats item (or chats/new "chat") -> a set_chats() row."""
     return {"chat_id": c["chat_id"], "name": c["name"], "unread": c["unread"],
-            "last_activity": ts(c["last_activity"]), "is_dm": c["is_dm"]}
+            "last_activity": ts(c["last_activity"]), "is_dm": c["is_dm"],
+            "pending": c["pending"]}       # an invitation you have not answered yet
 
 
 def message_row(m, my_user_id):
     """Message -> a set_messages() / append_message() row."""
-    sender = m["sender"]
-    return {"id": m["message_id"],
-            "sender": sender["username"] if sender else "(system)",   # system lines have no sender
-            "text": m["content"],
-            "time": ts(m["created_at"]),
-            "own": sender is not None and sender["user_id"] == my_user_id}
+    return {"id": m["id"],
+            "sender": m["sender"] or "[System]",       # a system line has sender null
+            "text": m["text"],
+            "time": ts(m["time"]),
+            "own": m["sender_id"] == my_user_id}
 ```
 
-`"(system)"` cannot be anyone's username (parentheses are not allowed in names). Keep every id as
+`"[System]"` cannot be anyone's username (brackets are not allowed in names). Keep every id as
 the string the server sent; the demo data's integer ids are only for the preview.
 
 The GUI's placeholder hooks map to these calls:
 
 | Hook in `chat_page.py` | Call |
 | ---------------------- | ---- |
-| `edit_profile` / `request_edit_profile(username, text_color, background)` | `PATCH users/profile` with `{"username", "text_color", "background"}` (send only what changed; `background` = `text_bg_color`) |
-| `change_password` / `request_change_password` | `PATCH users/profile/password` with `ChangePasswordFlow` (two steps; never a `password` field), then `RequestCord.set_auth(user_id, session_token)` |
+| `edit_profile` / `request_edit_profile(username, text_color, background)` | `PATCH users/profile` with `{"username", "text_color", "background"}` (send only what changed; `background` is accepted too) |
+| `change_password` / `request_change_password` | `PATCH users/password` with `{"new_password"}` — one request, no current password, and the session token stays as it is |
 | `logout` | `POST users/logout`, then `RequestCord.clear_auth()` and the login page |
 | `new_group` | `POST chats`; add the reply's `chat` to the list |
 | `add_people_to_group` / `request_invitees(chat_id, query)` | `GET chat/{chat_id}/invitees` with `{"query"}`, then `POST chat/{chat_id}/invite` with the picked `user_id` |
@@ -3466,47 +3331,49 @@ The GUI's placeholder hooks map to these calls:
 ### 5.2 Client duties
 
 1. **Read markers.** Send `POST chat/{chat_id}/read` after showing a chat's messages, and again
-   when an `event/message` arrives for the chat on screen. The server marks as read only your own
+   when an `chat/new_message` arrives for the chat on screen. The server marks as read only your own
    messages and the history from before you joined; without this call `unread` and the NEW line
    never go away.
 2. **Logged out.** A `251` reply to a call sent with credentials (every call except `POST users`
-   and `POST users/login`), or `event/session_revoked` with any reason, means this connection is
+   and `POST users/login`), or `login/revoked` with any reason, means this connection is
    no longer logged in: clear the credentials (`RequestCord.clear_auth()`) and show the login
    page. The socket stays open, so the user can log in again on it. A `251` from `POST users` or
    `POST users/login` only means that attempt failed: show the error and let the user try again.
 3. **Never log in automatically after `logged_in_elsewhere`.** Tell the user the account was
    opened somewhere else and wait for them. Two clients that log in by themselves would keep
    logging each other out.
-4. **Pending requests and invites.** After login, `GET users/requests` and show `incoming`
-   (accept, decline) and `outgoing` (cancel). Keep the list current with `event/request`
-   (`pending`: add; `accepted`, `declined`, `cancelled`: remove), and remove invites whose
-   `chat.chat_id` arrives in `event/group_deleted`. An invite can be answered by its group too
-   (`POST chat/{chat_id}/invite/accept` / `reject`). After accepting, add the reply's `chat` to the
-   chat list. An accepted DM request also arrives as `event/chat` on every connection of both
-   people, the accepting connection included (there it comes before the reply).
+4. **Invitations.** A group invitation is a `pending` row of `GET chats` (section 2.5) and
+   arrives as `chats/new`; answer it with `POST chat/{chat_id}/invite/accept` or
+   `.../invite/reject`, and replace the row with the accept reply's `chat`. Remove the row on
+   `chat/members_changed` with `change` `"invite_cancelled"` (the inviter took it back, or you
+   rejected it elsewhere) and on `chats/group_deleted` for that `chat_id`. A client that prefers
+   request objects can use `GET users/requests` and `users/request` instead; that is also where
+   DM requests live, on a server run with `DM_REQUIRE_ACCEPT=true` (item 5).
 5. **DMs open at once by default.** With the default `DM_REQUIRE_ACCEPT=false`, the first DM
-   creates the room (`event/chat` reaches both people) and nothing waits for approval. A server
+   creates the room (`chats/new` reaches both people) and nothing waits for approval. A server
    run with `DM_REQUIRE_ACCEPT=true` turns the first DM into a request that the receiver must
    accept (item 4).
 6. **A long timeout for the summary.** Wait up to 90 s for `GET chat/{chat_id}/summary`, or send
    it on a second connection that uses the same User ID and Session Token (never `users/login`
    there). The connection's other requests wait behind it.
-7. **New token after a password change.** Put `session_token` from the change's final reply into
-   the header at once (`RequestCord.set_auth`). The old token works only on that connection and
-   only for 30 s.
-8. **Your own messages.** The connection that sent a text message gets no `event/message` for it:
+7. **The password change keeps your session.** `PATCH users/password` answers
+   `{"user_id", "changed": true}` and no token: keep sending the token you already have, on every
+   connection. Nothing is logged out.
+8. **Your own messages.** The connection that sent a text message gets no `chat/new_message` for it:
    append the `message` from the reply (match it by `rid` if the GUI shows "sending" first).
-   Likewise, the connection that joins a group gets no `event/message` for its own join line: the
+   Likewise, the connection that joins a group gets no `chat/new_message` for its own join line: the
    reply's `chat.last_message` is that line.
-9. **Chat list updates.** `event/message` for a chat that is not open: increase its `unread`
+9. **Chat list updates.** `chat/new_message` for a chat that is not open: increase its `unread`
    (unless you sent it) and move it to the top with the new `last_activity`. A chat is added (or
-   replaced, if it is listed already) by `event/chat`, which reaches every connection of both
+   replaced, if it is listed already) by `chats/new`, which reaches every connection of both
    people, the acting one included, and by the replies of `POST chats`,
    `POST chat/{chat_id}/join`, `POST chat/{chat_id}/invite/accept`,
    `POST users/requests/{request_id}/accept` and `POST users/{user_id}/dm` (status `"sent"`). Your other connections learn about a group you
-   created or joined on another connection from `event/group_created` whose `created_by` is you
-   and `event/group_updated` `"joined"` whose `user` is you; neither carries a Chat item, so fetch
-   the row with `GET chats`. The leave reply, `event/group_updated` `"left"` whose `user` is you,
-   and `event/group_deleted` remove a chat. `GET chats` is always the truth if in doubt.
-10. **Routing.** Route on `path` and `method`, and on `rid` for replies; `event/...` paths are
-    pushes. Convert every timestamp with `ts()` before giving it to the GUI.
+   created or joined on another connection from `chats/group_created` whose `created_by` is you
+   and `chat/members_changed` `"joined"` whose `user` is you; neither carries a Chat item, so fetch
+   the row with `GET chats`. The leave reply, `chat/members_changed` `"left"` whose `user` is you,
+   and `chats/group_deleted` remove a chat. `GET chats` is always the truth if in doubt.
+10. **Routing.** Route a reply on its `rid`, or on `path` and `method` (section 1.2); an error
+    answers with the request URL, so `rid` is the only way to route one. A packet with no
+    `method` is a push (section 4). Convert every timestamp with `ts()` before giving it to
+    the GUI.

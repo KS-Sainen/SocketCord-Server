@@ -31,7 +31,7 @@ def make_config(**overrides) -> Config:
     # AI summaries use the offline engine, so no test ever calls the real (paid) API,
     # even when ANTHROPIC_API_KEY happens to be set.
     cfg = Config(host="127.0.0.1", port=0, scram_iterations=4096, reg_limit_enabled=False, workers=4,
-                 challenge_rate_per_minute=0, group_create_per_hour=0, request_rate_per_hour=0,
+                 register_rate_per_minute=0, group_create_per_hour=0, request_rate_per_hour=0,
                  membership_rate_per_minute=0, message_rate_per_minute=0, profile_rate_per_minute=0,
                  ai_provider="offline", ai_rate_per_minute=0, ai_daily_limit=0)
     for key, value in overrides.items():
@@ -55,7 +55,6 @@ class Harness:
 
     def client(self, **kw):
         from socketcord_client import SocketCordClient
-        kw.setdefault("min_iterations", 4096)
         c = SocketCordClient(*self.address, timeout=5.0, **kw)
         self.clients.append(c)
         return c

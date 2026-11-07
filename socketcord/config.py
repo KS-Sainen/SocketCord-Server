@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import secrets
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -50,19 +49,17 @@ class Config:
     max_connections_per_user: int = 5     # logged-in connections per account
     log_level: str = "INFO"
 
-    secret: bytes = field(default_factory=lambda: secrets.token_bytes(32))
-    scram_iterations: int = scram.DEFAULT_ITERATIONS
-    challenge_ttl: int = 60               # seconds a challenge stays valid
+    scram_iterations: int = scram.DEFAULT_ITERATIONS   # PBKDF2 rounds for a new password hash
     session_ttl_seconds: int = 7 * 24 * 3600
 
     login_max_failures: int = 5           # per (username, ip) ...
     login_failure_window: int = 300       # ... within this many seconds
     login_max_failures_per_client: int = 50   # per ip, over all usernames, in the same window
 
-    # Requests that make the server do expensive work (a 2048-bit DH step) are
-    # limited per client address: register and password-change challenges.
-    challenge_rate_per_minute: float = 30.0
-    challenge_burst: int = 15
+    # Registering runs PBKDF2 (SCRAM_ITERATIONS rounds) before anything is stored,
+    # so it is limited per client address.
+    register_rate_per_minute: float = 30.0
+    register_burst: int = 15
     # Things that push a packet to other users are limited per account.
     group_create_per_hour: float = 20.0   # POST chats
     request_rate_per_hour: float = 120.0  # DM requests and group invites
@@ -99,7 +96,6 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        secret_text = os.environ.get("SOCKETCORD_SECRET", "").strip()
         return cls(
             host=_env("SOCKETCORD_HOST", "0.0.0.0"),
             port=_env_int("SOCKETCORD_PORT", 8080),
@@ -109,15 +105,13 @@ class Config:
             max_connections_per_ip=_env_int("MAX_CONNECTIONS_PER_IP", 64),
             max_connections_per_user=_env_int("MAX_CONNECTIONS_PER_USER", 5),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
-            secret=secret_text.encode() if secret_text else secrets.token_bytes(32),
             scram_iterations=scram.check_iterations(_env_int("SCRAM_ITERATIONS", scram.DEFAULT_ITERATIONS)),
-            challenge_ttl=_env_int("CHALLENGE_TTL_SECONDS", 60),
             session_ttl_seconds=_env_int("SESSION_TTL_HOURS", 24 * 7) * 3600,
             login_max_failures=_env_int("LOGIN_MAX_FAILURES", 5),
             login_failure_window=_env_int("LOGIN_FAILURE_WINDOW_SECONDS", 300),
             login_max_failures_per_client=_env_int("LOGIN_MAX_FAILURES_PER_CLIENT", 50),
-            challenge_rate_per_minute=float(_env("CHALLENGE_RATE_PER_MINUTE", "30")),
-            challenge_burst=_env_int("CHALLENGE_BURST", 15),
+            register_rate_per_minute=float(_env("REGISTER_RATE_PER_MINUTE", "30")),
+            register_burst=_env_int("REGISTER_BURST", 15),
             group_create_per_hour=float(_env("GROUP_CREATE_PER_HOUR", "20")),
             request_rate_per_hour=float(_env("REQUEST_RATE_PER_HOUR", "120")),
             membership_rate_per_minute=float(_env("MEMBERSHIP_RATE_PER_MINUTE", "30")),

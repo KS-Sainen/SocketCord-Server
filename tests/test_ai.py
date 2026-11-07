@@ -67,7 +67,7 @@ def test_summary_of_recent_messages(server):
     a = server.user("amy")
     gid = group_with(a, ["we meet at 3pm", "bring the slides", "ok see you"])
     s = a.summary(gid)
-    assert s["path"] == f"chat/{gid}/summary"
+    assert s["path"] == "chat/summary"
     assert (s["summary"], s["engine"], s["model"], s["cached"]) == ("- the fake summary", "fake", "fake-model", False)
     assert (s["message_count"], s["omitted"], s["has_more"], s["mode"]) == (3, 0, False, "recent")
     job = fake.jobs[0]
